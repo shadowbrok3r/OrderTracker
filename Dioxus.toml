@@ -1,0 +1,17 @@
+[application]
+name = "order_tracker"
+default_platform = "desktop"
+asset_dir = "assets"
+
+[desktop]
+title = "Order Tracker - Shopify & Etsy"
+
+[desktop.window]
+width = 1400
+height = 900
+resizable = true
+decorations = true
+
+[bundle]
+identifier = "com.ordertracker.app"
+publisher = "Order Tracker"
