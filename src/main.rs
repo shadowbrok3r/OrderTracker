@@ -1,6 +1,6 @@
 #![allow(non_snake_case)]
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -160,48 +160,50 @@ struct ShopifyAddress {
 }
 
 // ============================================================================
-// Etsy API Types
+// Etsy API Types (v3: GET /v3/application/shops/{shop_id}/receipts)
 // ============================================================================
 
 #[derive(Debug, Deserialize)]
 struct EtsyReceiptsResponse {
+    count: Option<i32>,
     results: Vec<EtsyReceipt>,
-    count: i32,
 }
 
 #[derive(Debug, Deserialize)]
 struct EtsyReceipt {
     receipt_id: i64,
-    order_id: i64,
-    buyer_user_id: i64,
+    #[serde(default)]
+    order_id: Option<i64>,
     name: String,
+    #[serde(alias = "create_timestamp", alias = "created_timestamp")]
     create_timestamp: i64,
-    grandtotal: EtsyMoney,
-    transactions: Vec<EtsyTransaction>,
+    #[serde(alias = "total", default)]
+    grandtotal: Option<EtsyMoney>,
+    transactions: Option<Vec<EtsyTransaction>>,
+    first_line: Option<String>,
     formatted_address: Option<String>,
-    status: String,
+    status: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct EtsyMoney {
-    amount: i64,
-    divisor: i64,
-    currency_code: String,
+    amount: Option<i64>,
+    divisor: Option<i64>,
+    currency_code: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct EtsyTransaction {
-    title: String,
-    quantity: i32,
-    price: EtsyMoney,
+    title: Option<String>,
+    quantity: Option<i32>,
+    price: Option<EtsyMoney>,
     variations: Option<Vec<EtsyVariation>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct EtsyVariation {
-    property_id: i64,
-    formatted_name: String,
-    formatted_value: String,
+    formatted_name: Option<String>,
+    formatted_value: Option<String>,
 }
 
 // ============================================================================
@@ -317,29 +319,156 @@ async fn fetch_shopify_orders() -> Result<Vec<Order>, String> {
 }
 
 async fn fetch_etsy_orders() -> Result<Vec<Order>, String> {
-    // Note: Etsy OAuth 2.0 requires a more complex flow
-    // This is a simplified version - you may need to implement OAuth token refresh
+    // Etsy API v3: GET https://api.etsy.com/v3/application/shops/{shop_id}/receipts
+    // Requires x-api-key and Authorization: Bearer <oauth_token> (transactions_r scope)
     let client = reqwest::Client::new();
-    
-    // For Etsy API v3, you need your shop_id
-    // First, get the shop ID (you might want to store this)
-    let shop_url = "https://api.etsy.com/v3/application/users/me";
-    
-    let response = client
-        .get(shop_url)
-        .header("x-api-key", ETSY_KEYSTRING)
-        .header("Authorization", format!("Bearer {}", ETSY_SECRET))
-        .send()
-        .await
-        .map_err(|e| format!("Etsy user request failed: {}", e))?;
+    const LIMIT: i32 = 100;
+    let base_url = format!(
+        "https://api.etsy.com/v3/application/shops/{}/receipts",
+        ETSY_SHOP_ID
+    );
 
-    if !response.status().is_success() {
-        return Err(format!("Etsy API error: {} - Make sure your OAuth token is valid", response.status()));
+    let mut all_receipts = Vec::new();
+    let mut offset = 0i32;
+
+    loop {
+        let url = format!("{}?limit={}&offset={}", base_url, LIMIT, offset);
+        let response = client
+            .get(&url)
+            .header("x-api-key", ETSY_KEYSTRING)
+            .header("Authorization", format!("Bearer {}", ETSY_SECRET))
+            .send()
+            .await
+            .map_err(|e| format!("Etsy request failed: {}", e))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!(
+                "Etsy API error: {} - {}",
+                status,
+                if body.is_empty() {
+                    "Check x-api-key and OAuth token (Bearer) with transactions_r scope"
+                        .to_string()
+                } else {
+                    body
+                }
+            ));
+        }
+
+        let page: EtsyReceiptsResponse = response
+            .json()
+            .await
+            .map_err(|e| format!("Etsy response parse failed: {}", e))?;
+
+        let results = page.results;
+        let n = results.len() as i32;
+        all_receipts.extend(results);
+
+        if n < LIMIT {
+            break;
+        }
+        offset += LIMIT;
     }
 
-    // For now, return empty - you'll need to implement proper OAuth flow
-    // The ETSY_SECRET should be an OAuth access token, not the API secret
-    Ok(vec![])
+    let two_months_ago = Utc::now() - Duration::days(60);
+    let orders: Vec<Order> = all_receipts
+        .into_iter()
+        .filter_map(|r| {
+            let order_ts = r.create_timestamp;
+            // Etsy timestamps are usually in seconds
+            let order_date = Utc.timestamp_opt(order_ts, 0).single().unwrap_or(Utc::now());
+            if order_date < two_months_ago {
+                return None;
+            }
+            let due_date = order_date + Duration::days(14);
+            let total_money = r.grandtotal.as_ref()?;
+            let divisor = total_money.divisor.unwrap_or(100).max(1) as f64;
+            let total_price = (total_money.amount.unwrap_or(0) as f64) / divisor;
+            let currency = total_money
+                .currency_code
+                .clone()
+                .unwrap_or_else(|| "USD".to_string());
+
+            let items: Vec<OrderItem> = r
+                .transactions
+                .unwrap_or_default()
+                .into_iter()
+                .map(|t| {
+                    let title = t.title.unwrap_or_else(|| "Item".to_string());
+                    let qty = t.quantity.unwrap_or(1);
+                    let price_val = t.price.as_ref().map(|p| {
+                        let div = p.divisor.unwrap_or(100).max(1) as f64;
+                        (p.amount.unwrap_or(0) as f64) / div
+                    }).unwrap_or(0.0);
+                    let variant_parts: Vec<String> = t
+                        .variations
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|v| {
+                            let n = v.formatted_name.unwrap_or_default();
+                            let val = v.formatted_value.unwrap_or_default();
+                            if n.is_empty() && val.is_empty() {
+                                None
+                            } else {
+                                Some(format!("{}: {}", n, val))
+                            }
+                        })
+                        .collect();
+                    let variant_info = if variant_parts.is_empty() {
+                        None
+                    } else {
+                        Some(variant_parts.join(", "))
+                    };
+                    let full_name = format!("{} {}", &title, variant_info.as_deref().unwrap_or(""));
+                    let metal_type = MetalType::from_string(&full_name);
+                    let ring_size = variant_parts
+                        .iter()
+                        .find(|s| s.to_lowercase().contains("ring") || s.to_lowercase().contains("size"))
+                        .cloned();
+                    OrderItem {
+                        name: title,
+                        quantity: qty as u32,
+                        price: price_val,
+                        metal_type,
+                        ring_size,
+                        variant_info,
+                    }
+                })
+                .collect();
+
+            let shipping_address = r
+                .first_line
+                .clone()
+                .or(r.formatted_address.clone());
+
+            Some(Order {
+                id: r.receipt_id.to_string(),
+                source: OrderSource::Etsy,
+                order_number: format!(
+                    "#{}",
+                    r.order_id.unwrap_or(r.receipt_id)
+                ),
+                customer_name: {
+                    let n = r.name.trim().to_string();
+                    if n.is_empty() {
+                        "Unknown".to_string()
+                    } else {
+                        n
+                    }
+                },
+                items,
+                order_date,
+                due_date,
+                total_price,
+                currency,
+                status: r.status.unwrap_or_else(|| "open".to_string()),
+                shipping_address,
+            })
+        })
+        .collect();
+
+    Ok(orders)
 }
 
 fn extract_ring_size(name: &str, properties: &Option<Vec<ShopifyProperty>>) -> Option<String> {
