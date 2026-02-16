@@ -3,13 +3,125 @@
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 // Environment variables for API tokens
 pub const ETSY_KEYSTRING: &str = env!("ETSY_KEYSTRING");
+/// Etsy app shared secret (for x-api-key header). In .env as ETSY_SECRET.
 pub const ETSY_SECRET: &str = env!("ETSY_SECRET");
 pub const ETSY_SHOP_ID: &str = env!("ETSY_SHOP_ID");
 pub const SHOPIFY_URL: &str = env!("SHOPIFY_URL");
 pub const SHOPIFY_ACCESS_TOKEN: &str = env!("SHOPIFY_ACCESS_TOKEN");
+
+// ============================================================================
+// Etsy OAuth (refresh token stored in config; access token obtained via refresh)
+// ============================================================================
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct EtsyOAuthConfig {
+    refresh_token: Option<String>,
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    expires_at_utc_secs: Option<i64>,
+}
+
+fn etsy_config_path() -> Option<PathBuf> {
+    directories::ProjectDirs::from("com", "KingsOfAlchemy", "OrderTracker")
+        .map(|d| d.config_dir().join("etsy_oauth.json"))
+}
+
+fn load_etsy_config() -> EtsyOAuthConfig {
+    let path = match etsy_config_path() {
+        Some(p) => p,
+        None => return EtsyOAuthConfig::default(),
+    };
+    let Ok(data) = std::fs::read_to_string(&path) else {
+        return EtsyOAuthConfig::default();
+    };
+    serde_json::from_str(&data).unwrap_or_default()
+}
+
+fn save_etsy_config(cfg: &EtsyOAuthConfig) -> Result<(), String> {
+    let path = etsy_config_path().ok_or_else(|| "No config dir".to_string())?;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let data = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
+    std::fs::write(&path, data).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Returns a valid Etsy OAuth access token: from config (if not expired), from refresh, or legacy ETSY_SECRET.
+async fn get_etsy_access_token() -> Result<String, String> {
+    let mut cfg = load_etsy_config();
+    let now_secs = Utc::now().timestamp();
+    let expires = cfg.expires_at_utc_secs.unwrap_or(0);
+    // Use cached access token if still valid (with 5 min buffer)
+    if cfg.access_token.is_some() && expires > now_secs + 300 {
+        return Ok(cfg.access_token.as_ref().unwrap().clone());
+    }
+    // Prefer OAuth refresh token over legacy ETSY_SECRET
+    if let Some(ref refresh) = cfg.refresh_token {
+        let refresh = refresh.clone();
+        return refresh_etsy_token_async(&mut cfg, &refresh).await;
+    }
+    // Legacy: use ETSY_SECRET from .env if set (e.g. manual token)
+    if !ETSY_SECRET.is_empty() {
+        return Ok(ETSY_SECRET.to_string());
+    }
+    Err("Etsy not connected. Get a refresh token from order-tracker.kingsofalchemy.com/connect and paste it in Settings.".to_string())
+}
+
+async fn refresh_etsy_token_async(cfg: &mut EtsyOAuthConfig, refresh_token: &str) -> Result<String, String> {
+    let params = [
+        ("grant_type", "refresh_token"),
+        ("client_id", ETSY_KEYSTRING),
+        ("refresh_token", refresh_token),
+    ];
+    let res = reqwest::Client::new()
+        .post("https://api.etsy.com/v3/public/oauth/token")
+        .form(&params)
+        .send()
+        .await
+        .map_err(|e| format!("Refresh request failed: {}", e))?;
+
+    if !res.status().is_success() {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        return Err(format!("Etsy token refresh failed: {} - {}", status, body));
+    }
+
+    #[derive(serde::Deserialize)]
+    struct TokenResponse {
+        access_token: String,
+        expires_in: Option<u64>,
+        refresh_token: Option<String>,
+    }
+    let tok: TokenResponse = res.json().await.map_err(|e| format!("Parse token response: {}", e))?;
+    let expires_in = tok.expires_in.unwrap_or(3600);
+    cfg.access_token = Some(tok.access_token.clone());
+    cfg.expires_at_utc_secs = Some(Utc::now().timestamp() + expires_in as i64);
+    if let Some(rt) = tok.refresh_token {
+        cfg.refresh_token = Some(rt);
+    }
+    let _ = save_etsy_config(cfg);
+    Ok(tok.access_token)
+}
+
+/// Save a new refresh token (from web OAuth flow) and clear cached access token so next use refreshes.
+pub fn save_etsy_refresh_token(refresh_token: String) -> Result<(), String> {
+    let mut cfg = load_etsy_config();
+    cfg.refresh_token = Some(refresh_token.trim().to_string());
+    cfg.access_token = None;
+    cfg.expires_at_utc_secs = None;
+    save_etsy_config(&cfg)
+}
+
+pub fn has_etsy_oauth() -> bool {
+    let cfg = load_etsy_config();
+    cfg.refresh_token.is_some() || (!ETSY_SECRET.is_empty())
+}
 
 // ============================================================================
 // Data Models
@@ -175,7 +287,8 @@ struct EtsyReceipt {
     #[serde(default)]
     order_id: Option<i64>,
     name: String,
-    #[serde(alias = "create_timestamp", alias = "created_timestamp")]
+    // Etsy returns both create_timestamp and created_timestamp; use one to avoid duplicate-field error
+    #[serde(rename = "created_timestamp")]
     create_timestamp: i64,
     #[serde(alias = "total", default)]
     grandtotal: Option<EtsyMoney>,
@@ -319,14 +432,17 @@ async fn fetch_shopify_orders() -> Result<Vec<Order>, String> {
 }
 
 async fn fetch_etsy_orders() -> Result<Vec<Order>, String> {
+    let access_token = get_etsy_access_token().await?;
     // Etsy API v3: GET https://api.etsy.com/v3/application/shops/{shop_id}/receipts
-    // Requires x-api-key and Authorization: Bearer <oauth_token> (transactions_r scope)
+    // Requires x-api-key: {keystring}:{shared_secret} and Authorization: Bearer <oauth_token>
     let client = reqwest::Client::new();
     const LIMIT: i32 = 100;
     let base_url = format!(
         "https://api.etsy.com/v3/application/shops/{}/receipts",
         ETSY_SHOP_ID
     );
+
+    let x_api_key = format!("{}:{}", ETSY_KEYSTRING, ETSY_SECRET);
 
     let mut all_receipts = Vec::new();
     let mut offset = 0i32;
@@ -335,8 +451,8 @@ async fn fetch_etsy_orders() -> Result<Vec<Order>, String> {
         let url = format!("{}?limit={}&offset={}", base_url, LIMIT, offset);
         let response = client
             .get(&url)
-            .header("x-api-key", ETSY_KEYSTRING)
-            .header("Authorization", format!("Bearer {}", ETSY_SECRET))
+            .header("x-api-key", &x_api_key)
+            .header("Authorization", format!("Bearer {}", access_token))
             .send()
             .await
             .map_err(|e| format!("Etsy request failed: {}", e))?;
@@ -356,10 +472,20 @@ async fn fetch_etsy_orders() -> Result<Vec<Order>, String> {
             ));
         }
 
-        let page: EtsyReceiptsResponse = response
-            .json()
-            .await
-            .map_err(|e| format!("Etsy response parse failed: {}", e))?;
+        let raw_body = response.text().await.map_err(|e| format!("Etsy response read failed: {}", e))?;
+
+        let page: EtsyReceiptsResponse = match serde_json::from_str(&raw_body) {
+            Ok(p) => p,
+            Err(e) => {
+                let preview = if raw_body.len() > 1500 {
+                    format!("{}... (truncated)", &raw_body[..1500])
+                } else {
+                    raw_body.clone()
+                };
+                eprintln!("[Etsy API raw response (offset={})]: {}", offset, preview);
+                return Err(format!("Etsy response parse failed: {} | raw preview: {}", e, preview));
+            }
+        };
 
         let results = page.results;
         let n = results.len() as i32;
@@ -376,19 +502,28 @@ async fn fetch_etsy_orders() -> Result<Vec<Order>, String> {
         .into_iter()
         .filter_map(|r| {
             let order_ts = r.create_timestamp;
-            // Etsy timestamps are usually in seconds
-            let order_date = Utc.timestamp_opt(order_ts, 0).single().unwrap_or(Utc::now());
+            // Etsy timestamps: can be seconds or milliseconds
+            let order_date = if order_ts > 1_000_000_000_000 {
+                Utc.timestamp_millis_opt(order_ts).single().unwrap_or(Utc::now())
+            } else {
+                Utc.timestamp_opt(order_ts, 0).single().unwrap_or(Utc::now())
+            };
             if order_date < two_months_ago {
                 return None;
             }
             let due_date = order_date + Duration::days(14);
-            let total_money = r.grandtotal.as_ref()?;
-            let divisor = total_money.divisor.unwrap_or(100).max(1) as f64;
-            let total_price = (total_money.amount.unwrap_or(0) as f64) / divisor;
-            let currency = total_money
-                .currency_code
-                .clone()
-                .unwrap_or_else(|| "USD".to_string());
+
+            let (total_price, currency) = if let Some(ref total_money) = r.grandtotal {
+                let divisor = total_money.divisor.unwrap_or(100).max(1) as f64;
+                let price = (total_money.amount.unwrap_or(0) as f64) / divisor;
+                let curr = total_money
+                    .currency_code
+                    .clone()
+                    .unwrap_or_else(|| "USD".to_string());
+                (price, curr)
+            } else {
+                (0.0, "USD".to_string())
+            };
 
             let items: Vec<OrderItem> = r
                 .transactions
@@ -436,6 +571,12 @@ async fn fetch_etsy_orders() -> Result<Vec<Order>, String> {
                     }
                 })
                 .collect();
+
+            let total_price = if total_price > 0.0 {
+                total_price
+            } else {
+                items.iter().map(|i| i.price * i.quantity as f64).sum::<f64>()
+            };
 
             let shipping_address = r
                 .first_line
@@ -543,6 +684,9 @@ fn App() -> Element {
     let mut view_filter = use_signal(|| ViewFilter::All);
     let mut sort_by = use_signal(|| SortBy::DueDate);
     let mut search_query = use_signal(String::new);
+    let mut settings_open = use_signal(|| false);
+    let mut etsy_token_input = use_signal(String::new);
+    let mut etsy_save_message = use_signal(|| None::<String>);
 
     // Fetch orders on mount
     use_effect(move || {
@@ -559,6 +703,7 @@ fn App() -> Element {
                 }
                 Err(e) => {
                     eprintln!("Shopify error: {}", e);
+                    error.set(Some(format!("Shopify: {}", e)));
                 }
             }
 
@@ -569,6 +714,7 @@ fn App() -> Element {
                 }
                 Err(e) => {
                     eprintln!("Etsy error: {}", e);
+                    error.set(Some(format!("Etsy: {}", e)));
                 }
             }
 
@@ -647,27 +793,112 @@ fn App() -> Element {
                     div { class: "flex items-center gap-3",
                         button {
                             class: "btn-cosmic",
-                            onclick: move |_| {
-                                loading.set(true);
-                                spawn(async move {
-                                    // Re-fetch orders
-                                    let mut all_orders = Vec::new();
-                                    if let Ok(shopify) = fetch_shopify_orders().await {
-                                        all_orders.extend(shopify);
-                                    }
-                                    if let Ok(etsy) = fetch_etsy_orders().await {
-                                        all_orders.extend(etsy);
-                                    }
-                                    all_orders.sort_by(|a, b| a.due_date.cmp(&b.due_date));
-                                    orders.set(all_orders);
-                                    loading.set(false);
-                                });
-                            },
+                                onclick: move |_| {
+                                    loading.set(true);
+                                    error.set(None);
+                                    spawn(async move {
+                                        let mut all_orders = Vec::new();
+                                        match fetch_shopify_orders().await {
+                                            Ok(shopify) => all_orders.extend(shopify),
+                                            Err(e) => {
+                                                eprintln!("Shopify error: {}", e);
+                                                error.set(Some(format!("Shopify: {}", e)));
+                                            }
+                                        }
+                                        match fetch_etsy_orders().await {
+                                            Ok(etsy) => all_orders.extend(etsy),
+                                            Err(e) => {
+                                                eprintln!("Etsy error: {}", e);
+                                                error.set(Some(format!("Etsy: {}", e)));
+                                            }
+                                        }
+                                        all_orders.sort_by(|a, b| a.due_date.cmp(&b.due_date));
+                                        orders.set(all_orders);
+                                        loading.set(false);
+                                    });
+                                },
                             "🔄 Refresh"
+                        }
+                        button {
+                            class: "btn-cosmic",
+                            onclick: move |_| {
+                                settings_open.set(true);
+                                etsy_save_message.set(None);
+                            },
+                            "⚙️ Settings"
                         }
                     }
                 }
             }
+
+            // Settings modal
+            {if *settings_open.read() {
+                rsx! {
+                    div {
+                        class: "fixed inset-0 z-50 flex items-center justify-center bg-black/60",
+                        div {
+                            class: "card-cosmic p-6 max-w-lg w-full mx-4 max-h-[90vh] overflow-y-auto",
+                            onclick: move |evt| { evt.stop_propagation(); },
+                            h2 { class: "text-xl font-bold text-star-white mb-4", "⚙️ Settings" }
+                            div { class: "space-y-4",
+                                div {
+                                    class: "border border-nebula-purple rounded-lg p-4",
+                                    h3 { class: "text-star-white font-medium mb-2", "🧶 Connect Etsy" }
+                                    p { class: "text-stardust text-sm mb-3",
+                                        "Get a refresh token from the Order Tracker website, then paste it below."
+                                    }
+                                    a {
+                                        href: "https://order-tracker.kingsofalchemy.com/connect",
+                                        target: "_blank",
+                                        class: "text-nebula-purple underline text-sm mb-3 block",
+                                        "Get token at order-tracker.kingsofalchemy.com/connect →"
+                                    }
+                                    textarea {
+                                        class: "w-full bg-nebula-dark border border-nebula-purple rounded-lg px-3 py-2 text-star-white font-mono text-sm min-h-[80px]",
+                                        placeholder: "Paste Etsy refresh token here...",
+                                        value: "{etsy_token_input}",
+                                        oninput: move |evt| etsy_token_input.set(evt.value())
+                                    }
+                                    div { class: "flex gap-2 mt-2",
+                                        button {
+                                            class: "btn-nebula",
+                                            onclick: move |_| {
+                                                let token = etsy_token_input.read().clone();
+                                                if token.trim().is_empty() {
+                                                    etsy_save_message.set(Some("Enter a token first.".to_string()));
+                                                    return;
+                                                }
+                                                match save_etsy_refresh_token(token) {
+                                                    Ok(()) => {
+                                                        etsy_save_message.set(Some("Etsy connected. Refresh orders to load Etsy.".to_string()));
+                                                        etsy_token_input.set(String::new());
+                                                    }
+                                                    Err(e) => etsy_save_message.set(Some(e)),
+                                                }
+                                            },
+                                            "Save token"
+                                        }
+                                    }
+                                    {if let Some(msg) = etsy_save_message.read().as_ref() {
+                                        rsx! { p { class: "text-sm mt-2 text-stardust", "{msg}" } }
+                                    } else {
+                                        rsx! { }
+                                    }}
+                                }
+                            }
+                            div { class: "mt-6 flex justify-end",
+                                button {
+                                    class: "btn-cosmic",
+                                    onclick: move |_| settings_open.set(false),
+                                    "Close"
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                rsx! { }
+            }}
 
             // Main Content
             div { class: "container px-6 py-8",
