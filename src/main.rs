@@ -1,655 +1,23 @@
 #![allow(non_snake_case)]
 
-use chrono::{DateTime, Duration, TimeZone, Utc};
+mod components;
+mod db;
+mod etsy;
+mod log;
+mod model;
+mod shopify;
+
 use dioxus::prelude::*;
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use log::{app_logs_snapshot, LogEntry};
 
-// Environment variables for API tokens
-pub const ETSY_KEYSTRING: &str = env!("ETSY_KEYSTRING");
-/// Etsy app shared secret (for x-api-key header). In .env as ETSY_SECRET.
-pub const ETSY_SECRET: &str = env!("ETSY_SECRET");
-pub const ETSY_SHOP_ID: &str = env!("ETSY_SHOP_ID");
-pub const SHOPIFY_URL: &str = env!("SHOPIFY_URL");
-pub const SHOPIFY_ACCESS_TOKEN: &str = env!("SHOPIFY_ACCESS_TOKEN");
+use components::dialog::{DialogContent, DialogRoot, DialogTitle};
+use db::{lookup_piece_cost, ItemCostWeight, PieceCostRow};
+use etsy::{fetch_etsy_orders, save_etsy_refresh_token};
+use model::{MetalType, Order, OrderItem, OrderSource};
+use shopify::fetch_shopify_orders;
 
 // ============================================================================
-// Etsy OAuth (refresh token stored in config; access token obtained via refresh)
-// ============================================================================
-
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-struct EtsyOAuthConfig {
-    refresh_token: Option<String>,
-    #[serde(default)]
-    access_token: Option<String>,
-    #[serde(default)]
-    expires_at_utc_secs: Option<i64>,
-}
-
-fn etsy_config_path() -> Option<PathBuf> {
-    directories::ProjectDirs::from("com", "KingsOfAlchemy", "OrderTracker")
-        .map(|d| d.config_dir().join("etsy_oauth.json"))
-}
-
-fn load_etsy_config() -> EtsyOAuthConfig {
-    let path = match etsy_config_path() {
-        Some(p) => p,
-        None => return EtsyOAuthConfig::default(),
-    };
-    let Ok(data) = std::fs::read_to_string(&path) else {
-        return EtsyOAuthConfig::default();
-    };
-    serde_json::from_str(&data).unwrap_or_default()
-}
-
-fn save_etsy_config(cfg: &EtsyOAuthConfig) -> Result<(), String> {
-    let path = etsy_config_path().ok_or_else(|| "No config dir".to_string())?;
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let data = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
-    std::fs::write(&path, data).map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// Returns a valid Etsy OAuth access token: from config (if not expired), from refresh, or legacy ETSY_SECRET.
-async fn get_etsy_access_token() -> Result<String, String> {
-    let mut cfg = load_etsy_config();
-    let now_secs = Utc::now().timestamp();
-    let expires = cfg.expires_at_utc_secs.unwrap_or(0);
-    // Use cached access token if still valid (with 5 min buffer)
-    if cfg.access_token.is_some() && expires > now_secs + 300 {
-        return Ok(cfg.access_token.as_ref().unwrap().clone());
-    }
-    // Prefer OAuth refresh token over legacy ETSY_SECRET
-    if let Some(ref refresh) = cfg.refresh_token {
-        let refresh = refresh.clone();
-        return refresh_etsy_token_async(&mut cfg, &refresh).await;
-    }
-    // Legacy: use ETSY_SECRET from .env if set (e.g. manual token)
-    if !ETSY_SECRET.is_empty() {
-        return Ok(ETSY_SECRET.to_string());
-    }
-    Err("Etsy not connected. Get a refresh token from order-tracker.kingsofalchemy.com/connect and paste it in Settings.".to_string())
-}
-
-async fn refresh_etsy_token_async(cfg: &mut EtsyOAuthConfig, refresh_token: &str) -> Result<String, String> {
-    let params = [
-        ("grant_type", "refresh_token"),
-        ("client_id", ETSY_KEYSTRING),
-        ("refresh_token", refresh_token),
-    ];
-    let res = reqwest::Client::new()
-        .post("https://api.etsy.com/v3/public/oauth/token")
-        .form(&params)
-        .send()
-        .await
-        .map_err(|e| format!("Refresh request failed: {}", e))?;
-
-    if !res.status().is_success() {
-        let status = res.status();
-        let body = res.text().await.unwrap_or_default();
-        return Err(format!("Etsy token refresh failed: {} - {}", status, body));
-    }
-
-    #[derive(serde::Deserialize)]
-    struct TokenResponse {
-        access_token: String,
-        expires_in: Option<u64>,
-        refresh_token: Option<String>,
-    }
-    let tok: TokenResponse = res.json().await.map_err(|e| format!("Parse token response: {}", e))?;
-    let expires_in = tok.expires_in.unwrap_or(3600);
-    cfg.access_token = Some(tok.access_token.clone());
-    cfg.expires_at_utc_secs = Some(Utc::now().timestamp() + expires_in as i64);
-    if let Some(rt) = tok.refresh_token {
-        cfg.refresh_token = Some(rt);
-    }
-    let _ = save_etsy_config(cfg);
-    Ok(tok.access_token)
-}
-
-/// Save a new refresh token (from web OAuth flow) and clear cached access token so next use refreshes.
-pub fn save_etsy_refresh_token(refresh_token: String) -> Result<(), String> {
-    let mut cfg = load_etsy_config();
-    cfg.refresh_token = Some(refresh_token.trim().to_string());
-    cfg.access_token = None;
-    cfg.expires_at_utc_secs = None;
-    save_etsy_config(&cfg)
-}
-
-pub fn has_etsy_oauth() -> bool {
-    let cfg = load_etsy_config();
-    cfg.refresh_token.is_some() || (!ETSY_SECRET.is_empty())
-}
-
-// ============================================================================
-// Data Models
-// ============================================================================
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum MetalType {
-    Gold,
-    Silver,
-    Bronze,
-    Unknown,
-}
-
-impl MetalType {
-    fn from_string(s: &str) -> Self {
-        let lower = s.to_lowercase();
-        if lower.contains("gold") || lower.contains("14k") || lower.contains("18k") || lower.contains("10k") {
-            MetalType::Gold
-        } else if lower.contains("silver") || lower.contains("sterling") || lower.contains("925") {
-            MetalType::Silver
-        } else if lower.contains("bronze") || lower.contains("brass") {
-            MetalType::Bronze
-        } else {
-            MetalType::Unknown
-        }
-    }
-
-    fn display_class(&self) -> &'static str {
-        match self {
-            MetalType::Gold => "badge-gold",
-            MetalType::Silver => "badge-silver",
-            MetalType::Bronze => "badge-bronze",
-            MetalType::Unknown => "badge-nebula",
-        }
-    }
-
-    fn display_name(&self) -> &'static str {
-        match self {
-            MetalType::Gold => "Gold",
-            MetalType::Silver => "Silver",
-            MetalType::Bronze => "Bronze",
-            MetalType::Unknown => "Unknown",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum OrderSource {
-    Shopify,
-    Etsy,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Order {
-    pub id: String,
-    pub source: OrderSource,
-    pub order_number: String,
-    pub customer_name: String,
-    pub items: Vec<OrderItem>,
-    pub order_date: DateTime<Utc>,
-    pub due_date: DateTime<Utc>,
-    pub total_price: f64,
-    pub currency: String,
-    pub status: String,
-    pub shipping_address: Option<String>,
-}
-
-impl Order {
-    pub fn days_until_due(&self) -> i64 {
-        let now = Utc::now();
-        (self.due_date - now).num_days()
-    }
-
-    pub fn urgency_class(&self) -> &'static str {
-        let days = self.days_until_due();
-        if days < 0 {
-            "urgency-overdue"
-        } else if days <= 3 {
-            "urgency-critical"
-        } else if days <= 7 {
-            "urgency-warning"
-        } else {
-            "urgency-ok"
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct OrderItem {
-    pub name: String,
-    pub quantity: u32,
-    pub price: f64,
-    pub metal_type: MetalType,
-    pub ring_size: Option<String>,
-    pub variant_info: Option<String>,
-}
-
-// ============================================================================
-// Shopify API Types
-// ============================================================================
-
-#[derive(Debug, Deserialize)]
-struct ShopifyOrdersResponse {
-    orders: Vec<ShopifyOrder>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ShopifyOrder {
-    id: i64,
-    order_number: i64,
-    created_at: String,
-    customer: Option<ShopifyCustomer>,
-    line_items: Vec<ShopifyLineItem>,
-    total_price: String,
-    currency: String,
-    fulfillment_status: Option<String>,
-    shipping_address: Option<ShopifyAddress>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ShopifyCustomer {
-    first_name: Option<String>,
-    last_name: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ShopifyLineItem {
-    name: String,
-    quantity: i32,
-    price: String,
-    variant_title: Option<String>,
-    properties: Option<Vec<ShopifyProperty>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ShopifyProperty {
-    name: String,
-    value: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ShopifyAddress {
-    address1: Option<String>,
-    city: Option<String>,
-    province: Option<String>,
-    country: Option<String>,
-    zip: Option<String>,
-}
-
-// ============================================================================
-// Etsy API Types (v3: GET /v3/application/shops/{shop_id}/receipts)
-// ============================================================================
-
-#[derive(Debug, Deserialize)]
-struct EtsyReceiptsResponse {
-    count: Option<i32>,
-    results: Vec<EtsyReceipt>,
-}
-
-#[derive(Debug, Deserialize)]
-struct EtsyReceipt {
-    receipt_id: i64,
-    #[serde(default)]
-    order_id: Option<i64>,
-    name: String,
-    // Etsy returns both create_timestamp and created_timestamp; use one to avoid duplicate-field error
-    #[serde(rename = "created_timestamp")]
-    create_timestamp: i64,
-    #[serde(alias = "total", default)]
-    grandtotal: Option<EtsyMoney>,
-    transactions: Option<Vec<EtsyTransaction>>,
-    first_line: Option<String>,
-    formatted_address: Option<String>,
-    status: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct EtsyMoney {
-    amount: Option<i64>,
-    divisor: Option<i64>,
-    currency_code: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct EtsyTransaction {
-    title: Option<String>,
-    quantity: Option<i32>,
-    price: Option<EtsyMoney>,
-    variations: Option<Vec<EtsyVariation>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct EtsyVariation {
-    formatted_name: Option<String>,
-    formatted_value: Option<String>,
-}
-
-// ============================================================================
-// API Functions
-// ============================================================================
-
-async fn fetch_shopify_orders() -> Result<Vec<Order>, String> {
-    let client = reqwest::Client::new();
-    
-    // Get orders from the last 2 months, any status
-    let two_months_ago = Utc::now() - Duration::days(60);
-    let created_at_min = two_months_ago.format("%Y-%m-%dT%H:%M:%S%:z").to_string();
-    
-    // Use the SHOPIFY_URL env var and fetch all statuses
-    let url = format!(
-        "{}/orders.json?status=any&limit=250&created_at_min={}",
-        SHOPIFY_URL,
-        created_at_min
-    );
-
-    let response = client
-        .get(&url)
-        .header("X-Shopify-Access-Token", SHOPIFY_ACCESS_TOKEN)
-        .header("Content-Type", "application/json")
-        .send()
-        .await
-        .map_err(|e| format!("Shopify request failed: {}", e))?;
-
-    if !response.status().is_success() {
-        return Err(format!("Shopify API error: {}", response.status()));
-    }
-
-    let shopify_response: ShopifyOrdersResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse Shopify response: {}", e))?;
-
-    let orders = shopify_response
-        .orders
-        .into_iter()
-        .map(|so| {
-            let order_date = DateTime::parse_from_rfc3339(&so.created_at)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
-
-            // Due date is 2 weeks from order date
-            let due_date = order_date + Duration::days(14);
-
-            let customer_name = so
-                .customer
-                .map(|c| {
-                    format!(
-                        "{} {}",
-                        c.first_name.unwrap_or_default(),
-                        c.last_name.unwrap_or_default()
-                    )
-                    .trim()
-                    .to_string()
-                })
-                .unwrap_or_else(|| "Unknown Customer".to_string());
-
-            let items: Vec<OrderItem> = so
-                .line_items
-                .into_iter()
-                .map(|li| {
-                    let full_name = format!(
-                        "{} {}",
-                        li.name,
-                        li.variant_title.clone().unwrap_or_default()
-                    );
-                    let metal_type = MetalType::from_string(&full_name);
-                    let ring_size = extract_ring_size(&full_name, &li.properties);
-
-                    OrderItem {
-                        name: li.name,
-                        quantity: li.quantity as u32,
-                        price: li.price.parse().unwrap_or(0.0),
-                        metal_type,
-                        ring_size,
-                        variant_info: li.variant_title,
-                    }
-                })
-                .collect();
-
-            let shipping_address = so.shipping_address.map(|addr| {
-                format!(
-                    "{}, {}, {} {} {}",
-                    addr.address1.unwrap_or_default(),
-                    addr.city.unwrap_or_default(),
-                    addr.province.unwrap_or_default(),
-                    addr.zip.unwrap_or_default(),
-                    addr.country.unwrap_or_default()
-                )
-            });
-
-            Order {
-                id: so.id.to_string(),
-                source: OrderSource::Shopify,
-                order_number: format!("#{}", so.order_number),
-                customer_name,
-                items,
-                order_date,
-                due_date,
-                total_price: so.total_price.parse().unwrap_or(0.0),
-                currency: so.currency,
-                status: so.fulfillment_status.unwrap_or_else(|| "unfulfilled".to_string()),
-                shipping_address,
-            }
-        })
-        .collect();
-
-    Ok(orders)
-}
-
-async fn fetch_etsy_orders() -> Result<Vec<Order>, String> {
-    let access_token = get_etsy_access_token().await?;
-    // Etsy API v3: GET https://api.etsy.com/v3/application/shops/{shop_id}/receipts
-    // Requires x-api-key: {keystring}:{shared_secret} and Authorization: Bearer <oauth_token>
-    let client = reqwest::Client::new();
-    const LIMIT: i32 = 100;
-    let base_url = format!(
-        "https://api.etsy.com/v3/application/shops/{}/receipts",
-        ETSY_SHOP_ID
-    );
-
-    let x_api_key = format!("{}:{}", ETSY_KEYSTRING, ETSY_SECRET);
-
-    let mut all_receipts = Vec::new();
-    let mut offset = 0i32;
-
-    loop {
-        let url = format!("{}?limit={}&offset={}", base_url, LIMIT, offset);
-        let response = client
-            .get(&url)
-            .header("x-api-key", &x_api_key)
-            .header("Authorization", format!("Bearer {}", access_token))
-            .send()
-            .await
-            .map_err(|e| format!("Etsy request failed: {}", e))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(format!(
-                "Etsy API error: {} - {}",
-                status,
-                if body.is_empty() {
-                    "Check x-api-key and OAuth token (Bearer) with transactions_r scope"
-                        .to_string()
-                } else {
-                    body
-                }
-            ));
-        }
-
-        let raw_body = response.text().await.map_err(|e| format!("Etsy response read failed: {}", e))?;
-
-        let page: EtsyReceiptsResponse = match serde_json::from_str(&raw_body) {
-            Ok(p) => p,
-            Err(e) => {
-                let preview = if raw_body.len() > 1500 {
-                    format!("{}... (truncated)", &raw_body[..1500])
-                } else {
-                    raw_body.clone()
-                };
-                eprintln!("[Etsy API raw response (offset={})]: {}", offset, preview);
-                return Err(format!("Etsy response parse failed: {} | raw preview: {}", e, preview));
-            }
-        };
-
-        let results = page.results;
-        let n = results.len() as i32;
-        all_receipts.extend(results);
-
-        if n < LIMIT {
-            break;
-        }
-        offset += LIMIT;
-    }
-
-    let two_months_ago = Utc::now() - Duration::days(60);
-    let orders: Vec<Order> = all_receipts
-        .into_iter()
-        .filter_map(|r| {
-            let order_ts = r.create_timestamp;
-            // Etsy timestamps: can be seconds or milliseconds
-            let order_date = if order_ts > 1_000_000_000_000 {
-                Utc.timestamp_millis_opt(order_ts).single().unwrap_or(Utc::now())
-            } else {
-                Utc.timestamp_opt(order_ts, 0).single().unwrap_or(Utc::now())
-            };
-            if order_date < two_months_ago {
-                return None;
-            }
-            let due_date = order_date + Duration::days(14);
-
-            let (total_price, currency) = if let Some(ref total_money) = r.grandtotal {
-                let divisor = total_money.divisor.unwrap_or(100).max(1) as f64;
-                let price = (total_money.amount.unwrap_or(0) as f64) / divisor;
-                let curr = total_money
-                    .currency_code
-                    .clone()
-                    .unwrap_or_else(|| "USD".to_string());
-                (price, curr)
-            } else {
-                (0.0, "USD".to_string())
-            };
-
-            let items: Vec<OrderItem> = r
-                .transactions
-                .unwrap_or_default()
-                .into_iter()
-                .map(|t| {
-                    let title = t.title.unwrap_or_else(|| "Item".to_string());
-                    let qty = t.quantity.unwrap_or(1);
-                    let price_val = t.price.as_ref().map(|p| {
-                        let div = p.divisor.unwrap_or(100).max(1) as f64;
-                        (p.amount.unwrap_or(0) as f64) / div
-                    }).unwrap_or(0.0);
-                    let variant_parts: Vec<String> = t
-                        .variations
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter_map(|v| {
-                            let n = v.formatted_name.unwrap_or_default();
-                            let val = v.formatted_value.unwrap_or_default();
-                            if n.is_empty() && val.is_empty() {
-                                None
-                            } else {
-                                Some(format!("{}: {}", n, val))
-                            }
-                        })
-                        .collect();
-                    let variant_info = if variant_parts.is_empty() {
-                        None
-                    } else {
-                        Some(variant_parts.join(", "))
-                    };
-                    let full_name = format!("{} {}", &title, variant_info.as_deref().unwrap_or(""));
-                    let metal_type = MetalType::from_string(&full_name);
-                    let ring_size = variant_parts
-                        .iter()
-                        .find(|s| s.to_lowercase().contains("ring") || s.to_lowercase().contains("size"))
-                        .cloned();
-                    OrderItem {
-                        name: title,
-                        quantity: qty as u32,
-                        price: price_val,
-                        metal_type,
-                        ring_size,
-                        variant_info,
-                    }
-                })
-                .collect();
-
-            let total_price = if total_price > 0.0 {
-                total_price
-            } else {
-                items.iter().map(|i| i.price * i.quantity as f64).sum::<f64>()
-            };
-
-            let shipping_address = r
-                .first_line
-                .clone()
-                .or(r.formatted_address.clone());
-
-            Some(Order {
-                id: r.receipt_id.to_string(),
-                source: OrderSource::Etsy,
-                order_number: format!(
-                    "#{}",
-                    r.order_id.unwrap_or(r.receipt_id)
-                ),
-                customer_name: {
-                    let n = r.name.trim().to_string();
-                    if n.is_empty() {
-                        "Unknown".to_string()
-                    } else {
-                        n
-                    }
-                },
-                items,
-                order_date,
-                due_date,
-                total_price,
-                currency,
-                status: r.status.unwrap_or_else(|| "open".to_string()),
-                shipping_address,
-            })
-        })
-        .collect();
-
-    Ok(orders)
-}
-
-fn extract_ring_size(name: &str, properties: &Option<Vec<ShopifyProperty>>) -> Option<String> {
-    // Check properties first (Shopify custom options)
-    if let Some(props) = properties {
-        for prop in props {
-            let prop_name_lower = prop.name.to_lowercase();
-            if prop_name_lower.contains("size") || prop_name_lower.contains("ring") {
-                return Some(prop.value.clone());
-            }
-        }
-    }
-
-    // Try to extract from name/variant
-    let lower = name.to_lowercase();
-    
-    // Common ring size patterns
-    let patterns = [
-        "size ", "ring size ", "sz ", "us ", "uk ",
-    ];
-    
-    for pattern in patterns {
-        if let Some(idx) = lower.find(pattern) {
-            let start = idx + pattern.len();
-            let remaining = &name[start..];
-            let size: String = remaining
-                .chars()
-                .take_while(|c| c.is_numeric() || *c == '.' || *c == '/' || *c == ' ')
-                .collect();
-            if !size.trim().is_empty() {
-                return Some(size.trim().to_string());
-            }
-        }
-    }
-
-    None
-}
-
-// ============================================================================
-// App State
+// App state
 // ============================================================================
 
 #[derive(Debug, Clone, PartialEq)]
@@ -668,7 +36,7 @@ enum SortBy {
 }
 
 // ============================================================================
-// Components
+// Entry & root component
 // ============================================================================
 
 fn main() {
@@ -677,7 +45,6 @@ fn main() {
 
 #[component]
 fn App() -> Element {
-    // State
     let mut orders = use_signal(Vec::<Order>::new);
     let mut loading = use_signal(|| true);
     let mut error = use_signal(|| None::<String>);
@@ -687,82 +54,88 @@ fn App() -> Element {
     let mut settings_open = use_signal(|| false);
     let mut etsy_token_input = use_signal(String::new);
     let mut etsy_save_message = use_signal(|| None::<String>);
+    let mut detail_order = use_signal(|| None::<Order>);
+    let mut logs_open = use_signal(|| false);
+    let mut log_snapshot = use_signal(|| Vec::<LogEntry>::new());
+    let mut piece_costs_cache = use_signal(|| Vec::<PieceCostRow>::new());
 
-    // Fetch orders on mount
+    use_effect(move || {
+        spawn(async move {
+            if db::init_db().await.is_ok() {
+                match db::load_piece_costs(&*db::DB).await {
+                    Ok(rows) => piece_costs_cache.set(rows),
+                    Err(e) => log::app_log("INFO", format!("Piece costs load: {}", e)),
+                }
+            }
+        });
+    });
+
     use_effect(move || {
         spawn(async move {
             loading.set(true);
             error.set(None);
-
+            log::app_log("INFO", "Fetching orders...");
             let mut all_orders = Vec::new();
 
-            // Fetch Shopify orders
+            log::app_log("INFO", "Fetching Shopify orders...");
             match fetch_shopify_orders().await {
                 Ok(shopify_orders) => {
+                    log::app_log("INFO", format!("Shopify: {} orders", shopify_orders.len()));
                     all_orders.extend(shopify_orders);
                 }
                 Err(e) => {
-                    eprintln!("Shopify error: {}", e);
+                    log::app_log("ERROR", format!("Shopify: {}", e));
                     error.set(Some(format!("Shopify: {}", e)));
                 }
             }
-
-            // Fetch Etsy orders
+            log::app_log("INFO", "Fetching Etsy orders (paid, not yet shipped)...");
             match fetch_etsy_orders().await {
                 Ok(etsy_orders) => {
+                    log::app_log("INFO", format!("Etsy: {} orders", etsy_orders.len()));
                     all_orders.extend(etsy_orders);
                 }
                 Err(e) => {
-                    eprintln!("Etsy error: {}", e);
+                    log::app_log("ERROR", format!("Etsy: {}", e));
                     error.set(Some(format!("Etsy: {}", e)));
                 }
             }
 
-            // Sort by due date by default
             all_orders.sort_by(|a, b| a.due_date.cmp(&b.due_date));
-
+            let total = all_orders.len();
             orders.set(all_orders);
             loading.set(false);
+            log::app_log("INFO", format!("Done. {} total orders.", total));
         });
     });
 
-    // Filter and sort orders
     let filtered_orders = use_memo(move || {
         let mut result: Vec<Order> = orders
             .read()
             .iter()
             .filter(|order| {
-                // Apply view filter
                 let passes_filter = match *view_filter.read() {
                     ViewFilter::All => true,
                     ViewFilter::Shopify => matches!(order.source, OrderSource::Shopify),
                     ViewFilter::Etsy => matches!(order.source, OrderSource::Etsy),
                     ViewFilter::Urgent => order.days_until_due() <= 3,
                 };
-
-                // Apply search filter
                 let query = search_query.read().to_lowercase();
                 let passes_search = query.is_empty()
                     || order.customer_name.to_lowercase().contains(&query)
                     || order.order_number.to_lowercase().contains(&query)
                     || order.items.iter().any(|item| item.name.to_lowercase().contains(&query));
-
                 passes_filter && passes_search
             })
             .cloned()
             .collect();
-
-        // Apply sorting
         match *sort_by.read() {
             SortBy::DueDate => result.sort_by(|a, b| a.due_date.cmp(&b.due_date)),
             SortBy::OrderDate => result.sort_by(|a, b| b.order_date.cmp(&a.order_date)),
             SortBy::Customer => result.sort_by(|a, b| a.customer_name.cmp(&b.customer_name)),
         }
-
         result
     });
 
-    // Calculate stats
     let stats = use_memo(move || {
         let all = orders.read();
         let total = all.len();
@@ -773,13 +146,23 @@ fn App() -> Element {
         (total, shopify, etsy, urgent, overdue)
     });
 
+    // Pairs of (order to display, order to pass to detail modal) so we can clone in closure without `let` inside rsx!
+    let orders_for_table = use_memo(move || {
+        filtered_orders
+            .read()
+            .iter()
+            .map(|o| (o.clone(), o.clone()))
+            .collect::<Vec<(Order, Order)>>()
+    });
+
     rsx! {
         document::Stylesheet { href: asset!("/assets/styles.css") }
-        
+        document::Stylesheet { href: asset!("/assets/dx-components-theme.css") }
+        document::Stylesheet { href: asset!("/assets/dialog.css") }
+
         div { class: "bg-galaxy min-h-screen",
-            // Navigation Header
             nav { class: "nav-galaxy px-6 py-4",
-                div { class: "container flex items-center justify-between",
+                div { class: "container flex items-center justify-between flex-wrap gap-3",
                     div { class: "flex items-center gap-4",
                         h1 { class: "text-2xl font-bold text-star-white",
                             "📦 Order Tracker"
@@ -788,35 +171,50 @@ fn App() -> Element {
                             span { class: "live-dot" }
                             span { class: "text-sm text-stardust", "Live" }
                         }
+                        div { class: "nav-stats text-stardust text-sm flex items-center gap-4 flex-wrap",
+                            span { "📦 {stats.read().0} orders" }
+                            span { "🛒 {stats.read().1} Shopify" }
+                            span { "🧶 {stats.read().2} Etsy" }
+                            span { "⚠️ {stats.read().3} urgent" }
+                            span { "🚨 {stats.read().4} overdue" }
+                        }
                     }
-                    
                     div { class: "flex items-center gap-3",
                         button {
                             class: "btn-cosmic",
-                                onclick: move |_| {
-                                    loading.set(true);
-                                    error.set(None);
-                                    spawn(async move {
-                                        let mut all_orders = Vec::new();
-                                        match fetch_shopify_orders().await {
-                                            Ok(shopify) => all_orders.extend(shopify),
-                                            Err(e) => {
-                                                eprintln!("Shopify error: {}", e);
-                                                error.set(Some(format!("Shopify: {}", e)));
-                                            }
+                            onclick: move |_| {
+                                loading.set(true);
+                                error.set(None);
+                                spawn(async move {
+                                    log::app_log("INFO", "Refresh: fetching orders...");
+                                    let mut all_orders = Vec::new();
+                                    match fetch_shopify_orders().await {
+                                        Ok(shopify) => {
+                                            log::app_log("INFO", format!("Shopify: {} orders", shopify.len()));
+                                            all_orders.extend(shopify);
                                         }
-                                        match fetch_etsy_orders().await {
-                                            Ok(etsy) => all_orders.extend(etsy),
-                                            Err(e) => {
-                                                eprintln!("Etsy error: {}", e);
-                                                error.set(Some(format!("Etsy: {}", e)));
-                                            }
+                                        Err(e) => {
+                                            log::app_log("ERROR", format!("Shopify: {}", e));
+                                            error.set(Some(format!("Shopify: {}", e)));
                                         }
-                                        all_orders.sort_by(|a, b| a.due_date.cmp(&b.due_date));
-                                        orders.set(all_orders);
-                                        loading.set(false);
-                                    });
-                                },
+                                    }
+                                    match fetch_etsy_orders().await {
+                                        Ok(etsy) => {
+                                            log::app_log("INFO", format!("Etsy: {} orders", etsy.len()));
+                                            all_orders.extend(etsy);
+                                        }
+                                        Err(e) => {
+                                            log::app_log("ERROR", format!("Etsy: {}", e));
+                                            error.set(Some(format!("Etsy: {}", e)));
+                                        }
+                                    }
+                                    all_orders.sort_by(|a, b| a.due_date.cmp(&b.due_date));
+                                    let total = all_orders.len();
+                                    orders.set(all_orders);
+                                    loading.set(false);
+                                    log::app_log("INFO", format!("Refresh done. {} total orders.", total));
+                                });
+                            },
                             "🔄 Refresh"
                         }
                         button {
@@ -827,11 +225,18 @@ fn App() -> Element {
                             },
                             "⚙️ Settings"
                         }
+                        button {
+                            class: "btn-cosmic",
+                            onclick: move |_| {
+                                logs_open.set(true);
+                                log_snapshot.set(app_logs_snapshot());
+                            },
+                            "📋 Logs"
+                        }
                     }
                 }
             }
 
-            // Settings modal
             {if *settings_open.read() {
                 rsx! {
                     div {
@@ -900,41 +305,63 @@ fn App() -> Element {
                 rsx! { }
             }}
 
-            // Main Content
-            div { class: "container px-6 py-8",
-                // Stats Cards
-                div { class: "stats-grid mb-8",
-                    StatCard {
-                        title: "Total Orders",
-                        value: stats.read().0.to_string(),
-                        icon: "📦"
+            DialogRoot {
+                open: *logs_open.read(),
+                on_open_change: move |open: bool| logs_open.set(open),
+                DialogContent {
+                    class: "flex flex-col max-h-[85vh]",
+                    DialogTitle { "📋 Logs" }
+                    p { class: "text-stardust text-sm", "App and API activity. Re-open to refresh." }
+                    div { class: "flex-1 overflow-y-auto font-mono text-xs bg-nebula-dark rounded-lg p-3 border border-nebula-purple/30 min-h-[200px]",
+                        for entry in log_snapshot.read().iter() {
+                            div { class: "log-line py-0.5",
+                                span { class: "text-stardust mr-2", "{entry.time}" }
+                                span { class: if entry.level == "ERROR" { "text-warning-red font-semibold" } else { "text-aurora-purple" }, "{entry.level}" }
+                                span { class: "text-moonlight ml-2", "{entry.message}" }
+                            }
+                        }
                     }
-                    StatCard {
-                        title: "Shopify",
-                        value: stats.read().1.to_string(),
-                        icon: "🛒"
-                    }
-                    StatCard {
-                        title: "Etsy",
-                        value: stats.read().2.to_string(),
-                        icon: "🧶"
-                    }
-                    StatCard {
-                        title: "Urgent (≤3 days)",
-                        value: stats.read().3.to_string(),
-                        icon: "⚠️"
-                    }
-                    StatCard {
-                        title: "Overdue",
-                        value: stats.read().4.to_string(),
-                        icon: "🚨"
+                    div { class: "flex gap-2 mt-4",
+                        button {
+                            class: "btn-cosmic",
+                            onclick: move |_| log_snapshot.set(app_logs_snapshot()),
+                            "Refresh logs"
+                        }
+                        button {
+                            class: "btn-cosmic",
+                            onclick: move |_| logs_open.set(false),
+                            "Close"
+                        }
                     }
                 }
+            }
 
-                // Filters and Search
+            DialogRoot {
+                open: detail_order.read().is_some(),
+                on_open_change: move |open: bool| {
+                    if !open {
+                        detail_order.set(None);
+                    }
+                },
+                DialogContent {
+                    class: "max-w-2xl max-h-[90vh] overflow-y-auto",
+                    {if let Some(order) = detail_order.read().as_ref() {
+                        rsx! {
+                            OrderDetailDialog {
+                                order: order.clone(),
+                                piece_costs: piece_costs_cache.read().clone(),
+                                on_close: move |_| detail_order.set(None)
+                            }
+                        }
+                    } else {
+                        rsx! { }
+                    }}
+                }
+            }
+
+            div { class: "container px-6 py-6",
                 div { class: "card-cosmic p-6 mb-6",
                     div { class: "flex flex-wrap items-center gap-4",
-                        // Search
                         div { class: "flex-1 min-w-0",
                             input {
                                 r#type: "search",
@@ -944,8 +371,6 @@ fn App() -> Element {
                                 oninput: move |evt| search_query.set(evt.value())
                             }
                         }
-
-                        // Filter Buttons
                         div { class: "flex gap-2",
                             FilterButton {
                                 label: "All",
@@ -968,12 +393,10 @@ fn App() -> Element {
                                 onclick: move |_| view_filter.set(ViewFilter::Urgent)
                             }
                         }
-
-                        // Sort Dropdown
                         div { class: "flex items-center gap-2",
                             span { class: "text-stardust text-sm", "Sort by:" }
                             select {
-                                class: "bg-nebula-dark border border-nebula-purple rounded-lg px-3 py-2 text-star-white",
+                                class: "bg-nebula-dark border border-nebula-purple rounded-lg px-3 py-2",
                                 onchange: move |evt| {
                                     match evt.value().as_str() {
                                         "due" => sort_by.set(SortBy::DueDate),
@@ -990,7 +413,6 @@ fn App() -> Element {
                     }
                 }
 
-                // Orders List
                 div { class: "card-cosmic overflow-hidden",
                     if *loading.read() {
                         div { class: "p-8 text-center",
@@ -1006,23 +428,30 @@ fn App() -> Element {
                         }
                     } else {
                         div { class: "overflow-x-auto",
-                            table { class: "table-cosmic",
+                            table { class: "table-cosmic table-orders",
                                 thead {
                                     tr {
+                                        th { class: "th-thumb", "" }
                                         th { "Order" }
                                         th { "Customer" }
-                                        th { "Items" }
+                                        th { class: "th-items", "Items" }
                                         th { "Metal" }
                                         th { "Size" }
                                         th { "Due Date" }
                                         th { "Days Left" }
                                         th { "Total" }
+                                        th { title: "Our cost (from catalog)", "Cost" }
+                                        th { title: "Weight (g)", "Weight" }
                                         th { "Source" }
                                     }
                                 }
                                 tbody {
-                                    for order in filtered_orders.read().iter() {
-                                        OrderRow { order: order.clone() }
+                                    for (order, order_for_click) in orders_for_table.read().clone() {
+                                        OrderRow {
+                                            order,
+                                            piece_costs: piece_costs_cache.read().clone(),
+                                            on_click: move |_| detail_order.set(Some(order_for_click.clone())),
+                                        }
                                     }
                                 }
                             }
@@ -1030,30 +459,18 @@ fn App() -> Element {
                     }
                 }
 
-                // Error Display
-                if let Some(err) = error.read().as_ref() {
-                    div { class: "card-cosmic p-4 mt-4 border-warning-red",
-                        div { class: "flex items-center gap-3",
-                            span { class: "text-2xl", "⚠️" }
-                            p { class: "text-warning-red", "{err}" }
+                {if let Some(err) = error.read().as_ref() {
+                    rsx! {
+                        div { class: "card-cosmic p-4 mt-4 border-warning-red",
+                            div { class: "flex items-center gap-3",
+                                span { class: "text-2xl", "⚠️" }
+                                p { class: "text-warning-red", "{err}" }
+                            }
                         }
                     }
-                }
-            }
-        }
-    }
-}
-
-#[component]
-fn StatCard(title: String, value: String, icon: String) -> Element {
-    rsx! {
-        div { class: "card-stat",
-            div { class: "flex items-center justify-between",
-                div {
-                    p { class: "text-stardust text-sm font-medium mb-1", "{title}" }
-                    p { class: "stat-value", "{value}" }
-                }
-                span { class: "text-4xl opacity-75", "{icon}" }
+                } else {
+                    rsx! { }
+                }}
             }
         }
     }
@@ -1061,12 +478,7 @@ fn StatCard(title: String, value: String, icon: String) -> Element {
 
 #[component]
 fn FilterButton(label: String, active: bool, onclick: EventHandler<MouseEvent>) -> Element {
-    let class = if active {
-        "btn-nebula"
-    } else {
-        "btn-cosmic"
-    };
-
+    let class = if active { "btn-nebula" } else { "btn-cosmic" };
     rsx! {
         button {
             class: "{class}",
@@ -1077,10 +489,13 @@ fn FilterButton(label: String, active: bool, onclick: EventHandler<MouseEvent>) 
 }
 
 #[component]
-fn OrderRow(order: Order) -> Element {
+fn OrderRow(
+    order: Order,
+    piece_costs: Vec<PieceCostRow>,
+    on_click: EventHandler<MouseEvent>,
+) -> Element {
     let days_left = order.days_until_due();
     let urgency_class = order.urgency_class();
-    
     let days_display = if days_left < 0 {
         format!("{} overdue", days_left.abs())
     } else if days_left == 0 {
@@ -1090,25 +505,20 @@ fn OrderRow(order: Order) -> Element {
     } else {
         format!("{} days", days_left)
     };
-
     let source_badge = match order.source {
         OrderSource::Shopify => ("🛒 Shopify", "badge-method"),
         OrderSource::Etsy => ("🧶 Etsy", "badge-nebula"),
     };
-
-    // Get primary metal type and ring size from items
     let primary_metal = order
         .items
         .first()
         .map(|i| i.metal_type.clone())
         .unwrap_or(MetalType::Unknown);
-
     let ring_size = order
         .items
         .iter()
         .find_map(|i| i.ring_size.clone())
         .unwrap_or_else(|| "N/A".to_string());
-
     let items_display: Vec<String> = order
         .items
         .iter()
@@ -1120,28 +530,59 @@ fn OrderRow(order: Order) -> Element {
             }
         })
         .collect();
+    let items_tooltip = items_display.join("\n");
+    let first_image = order.items.first().and_then(|i| i.image_url.clone());
+
+    let (order_cost, order_weight) = order.items.iter().fold((0.0_f64, 0.0_f64), |(c, w), item| {
+        let cw = lookup_piece_cost(item, &piece_costs);
+        let q = item.quantity as f64;
+        (
+            c + cw.as_ref().map(|x| x.cost_usd * q).unwrap_or(0.0),
+            w + cw.as_ref().map(|x| x.weight_g * q).unwrap_or(0.0),
+        )
+    });
+    let cost_str = if order_cost > 0.0 {
+        format!("$ {:.2}", order_cost)
+    } else {
+        "—".to_string()
+    };
+    let weight_str = if order_weight > 0.0 {
+        format!("{:.1} g", order_weight)
+    } else {
+        "—".to_string()
+    };
 
     rsx! {
-        tr { class: "{urgency_class}",
-            td {
+        tr {
+            class: "{urgency_class} order-row-clickable",
+            onclick: move |evt| on_click.call(evt),
+            td { class: "td-thumb",
+                {match first_image.as_deref() {
+                    Some(url) => rsx! { img { class: "order-thumb", src: "{url}", alt: "" } },
+                    None => rsx! { span { class: "order-thumb-placeholder", "📦" } },
+                }}
+            }
+            td { class: "td-nowrap",
                 div { class: "font-semibold text-star-white", "{order.order_number}" }
-                div { class: "text-xs text-stardust", 
-                    "{order.order_date.format(\"%b %d, %Y\")}" 
+                div { class: "text-xs text-stardust",
+                    "{order.order_date.format(\"%b %d, %Y\")}"
                 }
             }
-            td { class: "text-moonlight", "{order.customer_name}" }
-            td {
-                div { class: "max-w-xs",
+            td { class: "td-nowrap text-moonlight", title: "{order.customer_name}",
+                span { class: "cell-truncate", "{order.customer_name}" }
+            }
+            td { class: "td-items", title: "{items_tooltip}",
+                div { class: "items-cell cell-truncate",
                     for (idx, item) in items_display.iter().enumerate() {
-                        div { 
-                            class: "text-sm truncate",
+                        div {
+                            class: "text-sm",
                             class: if idx > 0 { "text-stardust" } else { "text-star-white" },
                             "{item}"
                         }
                     }
                 }
             }
-            td {
+            td { class: "td-nowrap",
                 {
                     let badge_class = format!("badge {}", primary_metal.display_class());
                     let metal_name = primary_metal.display_name();
@@ -1150,14 +591,13 @@ fn OrderRow(order: Order) -> Element {
                     }
                 }
             }
-            td { 
+            td { class: "td-nowrap",
                 span { class: "font-mono text-aurora-purple", "{ring_size}" }
             }
-            td { 
-                class: "text-moonlight",
+            td { class: "td-nowrap text-moonlight",
                 "{order.due_date.format(\"%b %d\")}"
             }
-            td {
+            td { class: "td-nowrap",
                 {
                     let text_color = match urgency_class {
                         "urgency-overdue" => "font-bold text-warning-red",
@@ -1170,17 +610,142 @@ fn OrderRow(order: Order) -> Element {
                     }
                 }
             }
-            td { 
-                class: "text-star-white font-semibold",
+            td { class: "td-nowrap text-star-white font-semibold",
                 {format!("$ {:.2}", order.total_price)}
             }
-            td {
+            td { class: "td-nowrap text-stardust", title: "Our cost (from catalog)", "{cost_str}" }
+            td { class: "td-nowrap text-stardust", title: "Weight (g)", "{weight_str}" }
+            td { class: "td-nowrap",
                 {
                     let source_class = format!("badge {}", source_badge.1);
                     let source_name = source_badge.0;
                     rsx! {
                         span { class: "{source_class}", "{source_name}" }
                     }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn OrderDetailDialog(
+    order: Order,
+    piece_costs: Vec<PieceCostRow>,
+    on_close: EventHandler<MouseEvent>,
+) -> Element {
+    let source_label = match order.source {
+        OrderSource::Shopify => "🛒 Shopify",
+        OrderSource::Etsy => "🧶 Etsy",
+    };
+    let days_left = order.days_until_due();
+    let days_display = if days_left < 0 {
+        format!("{} days overdue", days_left.abs())
+    } else if days_left == 0 {
+        "Due today".to_string()
+    } else if days_left == 1 {
+        "1 day left".to_string()
+    } else {
+        format!("{} days left", days_left)
+    };
+    let total_str = format!("{} {:.2}", order.currency, order.total_price);
+
+    rsx! {
+        div { class: "flex items-center justify-between mb-4",
+            h2 { class: "text-xl font-bold text-star-white",
+                "{order.order_number}"
+            }
+            div { class: "flex items-center gap-2",
+                span { class: "badge badge-nebula", "{source_label}" }
+                button {
+                    class: "btn-cosmic text-sm",
+                    onclick: move |evt| on_close.call(evt),
+                    "Close"
+                }
+            }
+        }
+        {match order.source {
+            OrderSource::Etsy => rsx! {
+                p { class: "text-stardust text-sm mb-3",
+                    "Receipt ID: {order.id}"
+                }
+            },
+            OrderSource::Shopify => rsx! { },
+        }}
+        dl { class: "detail-grid",
+            dt { "Customer" }
+            dd { "{order.customer_name}" }
+            dt { "Order date" }
+            dd { "{order.order_date.format(\"%b %d, %Y\")}" }
+            dt { "Ship by / Due" }
+            dd { "{order.due_date.format(\"%b %d, %Y\")} ({days_display})" }
+            dt { "Status" }
+            dd { "{order.status}" }
+            dt { "Total" }
+            dd { class: "font-semibold text-star-white", "{total_str}" }
+        }
+        {{
+            let order_cost: f64 = order.items.iter()
+                .map(|item| {
+                    let cw = lookup_piece_cost(item, &piece_costs);
+                    (item.quantity as f64) * cw.as_ref().map(|x| x.cost_usd).unwrap_or(0.0)
+                })
+                .sum();
+            if order_cost > 0.0 {
+                let s = format!("$ {:.2}", order_cost);
+                rsx! {
+                    dt { "Our cost" }
+                    dd { class: "font-semibold text-aurora-purple", "{s}" }
+                }
+            } else {
+                rsx! { }
+            }
+        }}
+        {order.shipping_address.as_ref().map(|addr| rsx! {
+            div { class: "mt-4",
+                p { class: "text-stardust text-sm font-medium mb-1", "Shipping address" }
+                p { class: "text-moonlight text-sm", "{addr}" }
+            }
+        })}
+        div { class: "mt-4",
+            p { class: "text-stardust text-sm font-medium mb-2", "Items" }
+            div { class: "space-y-3",
+                for item in order.items.iter() {
+                    OrderDetailItemRow {
+                        item: item.clone(),
+                        cost_weight: lookup_piece_cost(item, &piece_costs),
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn OrderDetailItemRow(item: OrderItem, cost_weight: Option<ItemCostWeight>) -> Element {
+    let price_str = format!("${:.2}", item.price);
+    let (cost_str, weight_str) = match &cost_weight {
+        Some(cw) => (
+            format!("${:.2}", cw.cost_usd * item.quantity as f64),
+            format!("{:.1} g", cw.weight_g * item.quantity as f64),
+        ),
+        None => ("—".to_string(), "—".to_string()),
+    };
+    rsx! {
+        div { class: "flex items-start gap-3 p-3 rounded-lg bg-nebula-dark/50 border border-nebula-purple/20",
+            {item.image_url.as_ref().map(|url| rsx! {
+                img { class: "w-14 h-14 rounded object-cover flex-shrink-0", src: "{url}", alt: "" }
+            }).unwrap_or(rsx! {
+                div { class: "w-14 h-14 rounded bg-nebula-purple/20 flex items-center justify-center flex-shrink-0 text-2xl", "📦" }
+            })}
+            div { class: "min-w-0 flex-1",
+                p { class: "font-medium text-star-white", "{item.name}" }
+                {(item.quantity > 1).then(|| rsx! { p { class: "text-stardust text-sm", "Qty: {item.quantity}" } })}
+                {item.variant_info.as_ref().map(|v| rsx! { p { class: "text-stardust text-sm", "{v}" } })}
+                {item.ring_size.as_ref().map(|s| rsx! { p { class: "text-aurora-purple text-sm font-mono", "Size: {s}" } })}
+                p { class: "text-moonlight text-sm", "{item.metal_type.display_name()} · {price_str}" }
+                p { class: "text-stardust text-sm mt-1",
+                    "Our cost: {cost_str} · Weight: {weight_str}"
                 }
             }
         }

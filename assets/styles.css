@@ -76,7 +76,15 @@
    line-height: 1.6;
    min-height: 100vh;
  }
- 
+
+select {
+  background-color: var(--nebula-dark);
+}
+
+select option {
+  background-color: var(--nebula-dark);
+}
+
  /* Galaxy Background */
  .bg-galaxy {
    background: var(--void-black);
@@ -138,6 +146,13 @@
    background: linear-gradient(180deg, rgba(10, 10, 20, 0.98) 0%, rgba(10, 10, 20, 0.95) 100%);
    border-bottom: 1px solid rgba(139, 92, 246, 0.2);
    backdrop-filter: blur(20px);
+ }
+ 
+ .nav-stats {
+   display: flex;
+   align-items: center;
+   gap: 1rem;
+   flex-wrap: wrap;
  }
  
  .nav-link {
@@ -373,7 +388,23 @@
    background: rgba(239, 68, 68, 0.15);
  }
  
- /* Scrollbar */
+ .table-orders .th-thumb { width: 3rem; padding: 0.5rem; }
+ .table-orders .th-items { max-width: 140px; }
+ .table-orders .td-thumb { width: 3rem; padding: 0.5rem; vertical-align: middle; }
+ .table-orders .td-items { max-width: 140px; }
+ .table-orders .td-nowrap { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 1px; }
+ .table-orders .cell-truncate { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+ .table-orders .items-cell { max-width: 140px; overflow: hidden; }
+ .table-orders .items-cell div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+ .order-row-clickable { cursor: pointer; }
+ .order-thumb { width: 2.5rem; height: 2.5rem; object-fit: cover; border-radius: 4px; display: block; }
+ .order-thumb-placeholder { width: 2.5rem; height: 2.5rem; display: inline-flex; align-items: center; justify-content: center; font-size: 1.25rem; background: rgba(139, 92, 246, 0.2); border-radius: 4px; }
+ 
+ .detail-grid { display: grid; grid-template-columns: auto 1fr; gap: 0.5rem 1.5rem; margin: 0; }
+ .detail-grid dt { color: var(--stardust); font-size: 0.875rem; }
+.detail-grid dd { margin: 0; color: var(--star-white); }
+
+/* Scrollbar */
  ::-webkit-scrollbar {
    width: 8px;
    height: 8px;
@@ -785,6 +816,7 @@
  
  .bg-clip-text { -webkit-background-clip: text; background-clip: text; }
  .text-transparent { -webkit-text-fill-color: transparent; }
+ 
  
  /* Responsive */
  @media (min-width: 640px) {
