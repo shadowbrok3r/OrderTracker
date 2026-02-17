@@ -1,6 +1,6 @@
 [application]
 name = "order_tracker"
-default_platform = "desktop"
+default_platform = "web"
 asset_dir = "assets"
 
 [desktop]

@@ -6,8 +6,12 @@ use serde::Deserialize;
 
 use crate::model::{MetalType, Order, OrderItem, OrderSource};
 
-pub const SHOPIFY_URL: &str = env!("SHOPIFY_URL");
-pub const SHOPIFY_ACCESS_TOKEN: &str = env!("SHOPIFY_ACCESS_TOKEN");
+fn shopify_url() -> String {
+    std::env::var("SHOPIFY_URL").unwrap_or_default()
+}
+fn shopify_access_token() -> String {
+    std::env::var("SHOPIFY_ACCESS_TOKEN").unwrap_or_default()
+}
 
 // ---------------------------------------------------------------------------
 // Shopify API response types
@@ -104,13 +108,13 @@ pub async fn fetch_shopify_orders() -> Result<Vec<Order>, String> {
     let created_at_min = two_months_ago.format("%Y-%m-%dT%H:%M:%S%:z").to_string();
     let url = format!(
         "{}/orders.json?status=any&limit=250&created_at_min={}",
-        SHOPIFY_URL,
+        shopify_url(),
         created_at_min
     );
 
     let response = client
         .get(&url)
-        .header("X-Shopify-Access-Token", SHOPIFY_ACCESS_TOKEN)
+        .header("X-Shopify-Access-Token", shopify_access_token())
         .header("Content-Type", "application/json")
         .send()
         .await

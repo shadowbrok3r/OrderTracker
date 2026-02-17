@@ -1,20 +1,21 @@
 #![allow(non_snake_case)]
 
+mod api;
 mod components;
+#[cfg(feature = "server")]
 mod db;
+#[cfg(feature = "server")]
 mod etsy;
 mod log;
 mod model;
+#[cfg(feature = "server")]
 mod shopify;
 
 use dioxus::prelude::*;
 use log::{app_logs_snapshot, LogEntry};
 
 use components::dialog::{DialogContent, DialogRoot, DialogTitle};
-use db::{lookup_piece_cost, ItemCostWeight, PieceCostRow};
-use etsy::{fetch_etsy_orders, save_etsy_refresh_token};
-use model::{MetalType, Order, OrderItem, OrderSource};
-use shopify::fetch_shopify_orders;
+use model::{lookup_piece_cost, ItemCostWeight, MetalType, Order, OrderItem, OrderSource, PieceCostRow};
 
 // ============================================================================
 // App state
@@ -40,6 +41,10 @@ enum SortBy {
 // ============================================================================
 
 fn main() {
+    #[cfg(feature = "server")]
+    {
+        dotenvy::dotenv().ok();
+    }
     dioxus::launch(App);
 }
 
@@ -61,11 +66,9 @@ fn App() -> Element {
 
     use_effect(move || {
         spawn(async move {
-            if db::init_db().await.is_ok() {
-                match db::load_piece_costs(&*db::DB).await {
-                    Ok(rows) => piece_costs_cache.set(rows),
-                    Err(e) => log::app_log("INFO", format!("Piece costs load: {}", e)),
-                }
+            match api::fetch_piece_costs().await {
+                Ok(rows) => piece_costs_cache.set(rows),
+                Err(e) => log::app_log("INFO", format!("Piece costs load: {}", e)),
             }
         });
     });
@@ -75,36 +78,24 @@ fn App() -> Element {
             loading.set(true);
             error.set(None);
             log::app_log("INFO", "Fetching orders...");
-            let mut all_orders = Vec::new();
-
-            log::app_log("INFO", "Fetching Shopify orders...");
-            match fetch_shopify_orders().await {
-                Ok(shopify_orders) => {
-                    log::app_log("INFO", format!("Shopify: {} orders", shopify_orders.len()));
-                    all_orders.extend(shopify_orders);
+            match api::fetch_all_orders().await {
+                Ok(result) => {
+                    let total = result.orders.len();
+                    log::app_log("INFO", format!("Got {} total orders.", total));
+                    for err in &result.errors {
+                        log::app_log("ERROR", err.clone());
+                    }
+                    if let Some(first_err) = result.errors.first() {
+                        error.set(Some(first_err.clone()));
+                    }
+                    orders.set(result.orders);
                 }
                 Err(e) => {
-                    log::app_log("ERROR", format!("Shopify: {}", e));
-                    error.set(Some(format!("Shopify: {}", e)));
+                    log::app_log("ERROR", format!("Fetch failed: {}", e));
+                    error.set(Some(e.to_string()));
                 }
             }
-            log::app_log("INFO", "Fetching Etsy orders (paid, not yet shipped)...");
-            match fetch_etsy_orders().await {
-                Ok(etsy_orders) => {
-                    log::app_log("INFO", format!("Etsy: {} orders", etsy_orders.len()));
-                    all_orders.extend(etsy_orders);
-                }
-                Err(e) => {
-                    log::app_log("ERROR", format!("Etsy: {}", e));
-                    error.set(Some(format!("Etsy: {}", e)));
-                }
-            }
-
-            all_orders.sort_by(|a, b| a.due_date.cmp(&b.due_date));
-            let total = all_orders.len();
-            orders.set(all_orders);
             loading.set(false);
-            log::app_log("INFO", format!("Done. {} total orders.", total));
         });
     });
 
@@ -146,7 +137,6 @@ fn App() -> Element {
         (total, shopify, etsy, urgent, overdue)
     });
 
-    // Pairs of (order to display, order to pass to detail modal) so we can clone in closure without `let` inside rsx!
     let orders_for_table = use_memo(move || {
         filtered_orders
             .read()
@@ -165,18 +155,18 @@ fn App() -> Element {
                 div { class: "container flex items-center justify-between flex-wrap gap-3",
                     div { class: "flex items-center gap-4",
                         h1 { class: "text-2xl font-bold text-star-white",
-                            "📦 Order Tracker"
+                            "Order Tracker"
                         }
                         div { class: "live-indicator",
                             span { class: "live-dot" }
                             span { class: "text-sm text-stardust", "Live" }
                         }
                         div { class: "nav-stats text-stardust text-sm flex items-center gap-4 flex-wrap",
-                            span { "📦 {stats.read().0} orders" }
-                            span { "🛒 {stats.read().1} Shopify" }
-                            span { "🧶 {stats.read().2} Etsy" }
-                            span { "⚠️ {stats.read().3} urgent" }
-                            span { "🚨 {stats.read().4} overdue" }
+                            span { "{stats.read().0} orders" }
+                            span { "{stats.read().1} Shopify" }
+                            span { "{stats.read().2} Etsy" }
+                            span { "{stats.read().3} urgent" }
+                            span { "{stats.read().4} overdue" }
                         }
                     }
                     div { class: "flex items-center gap-3",
@@ -187,35 +177,27 @@ fn App() -> Element {
                                 error.set(None);
                                 spawn(async move {
                                     log::app_log("INFO", "Refresh: fetching orders...");
-                                    let mut all_orders = Vec::new();
-                                    match fetch_shopify_orders().await {
-                                        Ok(shopify) => {
-                                            log::app_log("INFO", format!("Shopify: {} orders", shopify.len()));
-                                            all_orders.extend(shopify);
+                                    match api::fetch_all_orders().await {
+                                        Ok(result) => {
+                                            let total = result.orders.len();
+                                            log::app_log("INFO", format!("Refresh done. {} total orders.", total));
+                                            for err in &result.errors {
+                                                log::app_log("ERROR", err.clone());
+                                            }
+                                            if let Some(first_err) = result.errors.first() {
+                                                error.set(Some(first_err.clone()));
+                                            }
+                                            orders.set(result.orders);
                                         }
                                         Err(e) => {
-                                            log::app_log("ERROR", format!("Shopify: {}", e));
-                                            error.set(Some(format!("Shopify: {}", e)));
+                                            log::app_log("ERROR", format!("Refresh error: {}", e));
+                                            error.set(Some(e.to_string()));
                                         }
                                     }
-                                    match fetch_etsy_orders().await {
-                                        Ok(etsy) => {
-                                            log::app_log("INFO", format!("Etsy: {} orders", etsy.len()));
-                                            all_orders.extend(etsy);
-                                        }
-                                        Err(e) => {
-                                            log::app_log("ERROR", format!("Etsy: {}", e));
-                                            error.set(Some(format!("Etsy: {}", e)));
-                                        }
-                                    }
-                                    all_orders.sort_by(|a, b| a.due_date.cmp(&b.due_date));
-                                    let total = all_orders.len();
-                                    orders.set(all_orders);
                                     loading.set(false);
-                                    log::app_log("INFO", format!("Refresh done. {} total orders.", total));
                                 });
                             },
-                            "🔄 Refresh"
+                            "Refresh"
                         }
                         button {
                             class: "btn-cosmic",
@@ -223,7 +205,7 @@ fn App() -> Element {
                                 settings_open.set(true);
                                 etsy_save_message.set(None);
                             },
-                            "⚙️ Settings"
+                            "Settings"
                         }
                         button {
                             class: "btn-cosmic",
@@ -231,7 +213,7 @@ fn App() -> Element {
                                 logs_open.set(true);
                                 log_snapshot.set(app_logs_snapshot());
                             },
-                            "📋 Logs"
+                            "Logs"
                         }
                     }
                 }
@@ -244,11 +226,11 @@ fn App() -> Element {
                         div {
                             class: "card-cosmic p-6 max-w-lg w-full mx-4 max-h-[90vh] overflow-y-auto",
                             onclick: move |evt| { evt.stop_propagation(); },
-                            h2 { class: "text-xl font-bold text-star-white mb-4", "⚙️ Settings" }
+                            h2 { class: "text-xl font-bold text-star-white mb-4", "Settings" }
                             div { class: "space-y-4",
                                 div {
                                     class: "border border-nebula-purple rounded-lg p-4",
-                                    h3 { class: "text-star-white font-medium mb-2", "🧶 Connect Etsy" }
+                                    h3 { class: "text-star-white font-medium mb-2", "Connect Etsy" }
                                     p { class: "text-stardust text-sm mb-3",
                                         "Get a refresh token from the Order Tracker website, then paste it below."
                                     }
@@ -256,7 +238,7 @@ fn App() -> Element {
                                         href: "https://order-tracker.kingsofalchemy.com/connect",
                                         target: "_blank",
                                         class: "text-nebula-purple underline text-sm mb-3 block",
-                                        "Get token at order-tracker.kingsofalchemy.com/connect →"
+                                        "Get token at order-tracker.kingsofalchemy.com/connect"
                                     }
                                     textarea {
                                         class: "w-full bg-nebula-dark border border-nebula-purple rounded-lg px-3 py-2 text-star-white font-mono text-sm min-h-[80px]",
@@ -273,13 +255,15 @@ fn App() -> Element {
                                                     etsy_save_message.set(Some("Enter a token first.".to_string()));
                                                     return;
                                                 }
-                                                match save_etsy_refresh_token(token) {
-                                                    Ok(()) => {
-                                                        etsy_save_message.set(Some("Etsy connected. Refresh orders to load Etsy.".to_string()));
-                                                        etsy_token_input.set(String::new());
+                                                spawn(async move {
+                                                    match api::save_etsy_token(token).await {
+                                                        Ok(()) => {
+                                                            etsy_save_message.set(Some("Etsy connected. Refresh orders to load Etsy.".to_string()));
+                                                            etsy_token_input.set(String::new());
+                                                        }
+                                                        Err(e) => etsy_save_message.set(Some(e.to_string())),
                                                     }
-                                                    Err(e) => etsy_save_message.set(Some(e)),
-                                                }
+                                                });
                                             },
                                             "Save token"
                                         }
@@ -310,7 +294,7 @@ fn App() -> Element {
                 on_open_change: move |open: bool| logs_open.set(open),
                 DialogContent {
                     class: "flex flex-col max-h-[85vh]",
-                    DialogTitle { "📋 Logs" }
+                    DialogTitle { "Logs" }
                     p { class: "text-stardust text-sm", "App and API activity. Re-open to refresh." }
                     div { class: "flex-1 overflow-y-auto font-mono text-xs bg-nebula-dark rounded-lg p-3 border border-nebula-purple/30 min-h-[200px]",
                         for entry in log_snapshot.read().iter() {
@@ -388,7 +372,7 @@ fn App() -> Element {
                                 onclick: move |_| view_filter.set(ViewFilter::Etsy)
                             }
                             FilterButton {
-                                label: "🔥 Urgent",
+                                label: "Urgent",
                                 active: *view_filter.read() == ViewFilter::Urgent,
                                 onclick: move |_| view_filter.set(ViewFilter::Urgent)
                             }
@@ -417,13 +401,12 @@ fn App() -> Element {
                     if *loading.read() {
                         div { class: "p-8 text-center",
                             div { class: "animate-pulse-glow inline-block",
-                                span { class: "text-4xl", "⏳" }
+                                span { class: "text-4xl", "..." }
                             }
                             p { class: "text-stardust mt-4", "Loading orders..." }
                         }
                     } else if filtered_orders.read().is_empty() {
                         div { class: "p-8 text-center",
-                            span { class: "text-4xl", "📭" }
                             p { class: "text-stardust mt-4", "No orders found" }
                         }
                     } else {
@@ -463,7 +446,6 @@ fn App() -> Element {
                     rsx! {
                         div { class: "card-cosmic p-4 mt-4 border-warning-red",
                             div { class: "flex items-center gap-3",
-                                span { class: "text-2xl", "⚠️" }
                                 p { class: "text-warning-red", "{err}" }
                             }
                         }
@@ -506,8 +488,8 @@ fn OrderRow(
         format!("{} days", days_left)
     };
     let source_badge = match order.source {
-        OrderSource::Shopify => ("🛒 Shopify", "badge-method"),
-        OrderSource::Etsy => ("🧶 Etsy", "badge-nebula"),
+        OrderSource::Shopify => ("Shopify", "badge-method"),
+        OrderSource::Etsy => ("Etsy", "badge-nebula"),
     };
     let primary_metal = order
         .items
@@ -544,12 +526,12 @@ fn OrderRow(
     let cost_str = if order_cost > 0.0 {
         format!("$ {:.2}", order_cost)
     } else {
-        "—".to_string()
+        "\u{2014}".to_string()
     };
     let weight_str = if order_weight > 0.0 {
         format!("{:.1} g", order_weight)
     } else {
-        "—".to_string()
+        "\u{2014}".to_string()
     };
 
     rsx! {
@@ -559,7 +541,7 @@ fn OrderRow(
             td { class: "td-thumb",
                 {match first_image.as_deref() {
                     Some(url) => rsx! { img { class: "order-thumb", src: "{url}", alt: "" } },
-                    None => rsx! { span { class: "order-thumb-placeholder", "📦" } },
+                    None => rsx! { span { class: "order-thumb-placeholder", "pkg" } },
                 }}
             }
             td { class: "td-nowrap",
@@ -635,8 +617,8 @@ fn OrderDetailDialog(
     on_close: EventHandler<MouseEvent>,
 ) -> Element {
     let source_label = match order.source {
-        OrderSource::Shopify => "🛒 Shopify",
-        OrderSource::Etsy => "🧶 Etsy",
+        OrderSource::Shopify => "Shopify",
+        OrderSource::Etsy => "Etsy",
     };
     let days_left = order.days_until_due();
     let days_display = if days_left < 0 {
@@ -729,23 +711,23 @@ fn OrderDetailItemRow(item: OrderItem, cost_weight: Option<ItemCostWeight>) -> E
             format!("${:.2}", cw.cost_usd * item.quantity as f64),
             format!("{:.1} g", cw.weight_g * item.quantity as f64),
         ),
-        None => ("—".to_string(), "—".to_string()),
+        None => ("\u{2014}".to_string(), "\u{2014}".to_string()),
     };
     rsx! {
         div { class: "flex items-start gap-3 p-3 rounded-lg bg-nebula-dark/50 border border-nebula-purple/20",
             {item.image_url.as_ref().map(|url| rsx! {
                 img { class: "w-14 h-14 rounded object-cover flex-shrink-0", src: "{url}", alt: "" }
             }).unwrap_or(rsx! {
-                div { class: "w-14 h-14 rounded bg-nebula-purple/20 flex items-center justify-center flex-shrink-0 text-2xl", "📦" }
+                div { class: "w-14 h-14 rounded bg-nebula-purple/20 flex items-center justify-center flex-shrink-0 text-2xl", "pkg" }
             })}
             div { class: "min-w-0 flex-1",
                 p { class: "font-medium text-star-white", "{item.name}" }
                 {(item.quantity > 1).then(|| rsx! { p { class: "text-stardust text-sm", "Qty: {item.quantity}" } })}
                 {item.variant_info.as_ref().map(|v| rsx! { p { class: "text-stardust text-sm", "{v}" } })}
                 {item.ring_size.as_ref().map(|s| rsx! { p { class: "text-aurora-purple text-sm font-mono", "Size: {s}" } })}
-                p { class: "text-moonlight text-sm", "{item.metal_type.display_name()} · {price_str}" }
+                p { class: "text-moonlight text-sm", "{item.metal_type.display_name()} | {price_str}" }
                 p { class: "text-stardust text-sm mt-1",
-                    "Our cost: {cost_str} · Weight: {weight_str}"
+                    "Our cost: {cost_str} | Weight: {weight_str}"
                 }
             }
         }

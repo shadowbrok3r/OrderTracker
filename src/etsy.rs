@@ -7,9 +7,15 @@ use std::path::PathBuf;
 
 use crate::model::{MetalType, Order, OrderItem, OrderSource};
 
-pub const ETSY_KEYSTRING: &str = env!("ETSY_KEYSTRING");
-pub const ETSY_SECRET: &str = env!("ETSY_SECRET");
-pub const ETSY_SHOP_ID: &str = env!("ETSY_SHOP_ID");
+fn etsy_keystring() -> String {
+    std::env::var("ETSY_KEYSTRING").unwrap_or_default()
+}
+fn etsy_secret() -> String {
+    std::env::var("ETSY_SECRET").unwrap_or_default()
+}
+fn etsy_shop_id() -> String {
+    std::env::var("ETSY_SHOP_ID").unwrap_or_default()
+}
 
 // ---------------------------------------------------------------------------
 // OAuth config (refresh token + cached access token)
@@ -25,6 +31,12 @@ struct EtsyOAuthConfig {
 }
 
 fn etsy_config_path() -> Option<PathBuf> {
+    // HA add-on: persistent storage at /data/
+    let ha_path = PathBuf::from("/data/etsy_oauth.json");
+    if ha_path.parent().is_some_and(|p| p.exists()) {
+        return Some(ha_path);
+    }
+    // Desktop / local dev: system config directory
     directories::ProjectDirs::from("com", "KingsOfAlchemy", "OrderTracker")
         .map(|d| d.config_dir().join("etsy_oauth.json"))
 }
@@ -61,16 +73,18 @@ async fn get_etsy_access_token() -> Result<String, String> {
         let refresh = refresh.clone();
         return refresh_etsy_token_async(&mut cfg, &refresh).await;
     }
-    if !ETSY_SECRET.is_empty() {
-        return Ok(ETSY_SECRET.to_string());
+    let secret = etsy_secret();
+    if !secret.is_empty() {
+        return Ok(secret);
     }
     Err("Etsy not connected. Get a refresh token from order-tracker.kingsofalchemy.com/connect and paste it in Settings.".to_string())
 }
 
 async fn refresh_etsy_token_async(cfg: &mut EtsyOAuthConfig, refresh_token: &str) -> Result<String, String> {
+    let keystring = etsy_keystring();
     let params = [
         ("grant_type", "refresh_token"),
-        ("client_id", ETSY_KEYSTRING),
+        ("client_id", keystring.as_str()),
         ("refresh_token", refresh_token),
     ];
     let res = reqwest::Client::new()
@@ -110,11 +124,6 @@ pub fn save_etsy_refresh_token(refresh_token: String) -> Result<(), String> {
     cfg.access_token = None;
     cfg.expires_at_utc_secs = None;
     save_etsy_config(&cfg)
-}
-
-pub fn has_etsy_oauth() -> bool {
-    let cfg = load_etsy_config();
-    cfg.refresh_token.is_some() || !ETSY_SECRET.is_empty()
 }
 
 // ---------------------------------------------------------------------------
@@ -160,7 +169,6 @@ struct EtsyTransaction {
     listing_id: Option<i64>,
     #[serde(default)]
     listing_image_id: Option<i64>,
-    /// Expected ship date (epoch seconds) — "Ship by" date for the order.
     #[serde(default)]
     expected_ship_date: Option<i64>,
 }
@@ -225,15 +233,13 @@ pub async fn fetch_etsy_orders() -> Result<Vec<Order>, String> {
     const LIMIT: i32 = 100;
     let base_url = format!(
         "https://api.etsy.com/v3/application/shops/{}/receipts",
-        ETSY_SHOP_ID
+        etsy_shop_id()
     );
-    let x_api_key = format!("{}:{}", ETSY_KEYSTRING, ETSY_SECRET);
+    let x_api_key = format!("{}:{}", etsy_keystring(), etsy_secret());
 
     let mut all_receipts = Vec::new();
     let mut offset = 0i32;
 
-    // Query only paid, not-yet-shipped orders (Etsy "open" work) for speed. See:
-    // https://developers.etsy.com/documentation/essentials/definitions
     let was_paid = true;
     let was_shipped = false;
     log::app_log("INFO", format!("Etsy: fetching receipts (was_paid={}, was_shipped={})", was_paid, was_shipped));
@@ -293,7 +299,6 @@ pub async fn fetch_etsy_orders() -> Result<Vec<Order>, String> {
 
     log::app_log("INFO", format!("Etsy: {} receipts total, fetching listing images...", all_receipts.len()));
 
-    // Collect (listing_id, listing_image_id) for thumbnail fetches.
     let mut image_keys: Vec<(i64, i64)> = Vec::new();
     for r in &all_receipts {
         for t in r.transactions.as_deref().unwrap_or(&[]) {
@@ -327,7 +332,6 @@ pub async fn fetch_etsy_orders() -> Result<Vec<Order>, String> {
             if order_date < two_months_ago {
                 return None;
             }
-            // Use Etsy "Ship by" (expected_ship_date) as due_date when present.
             let due_date = r
                 .transactions
                 .as_deref()
@@ -336,12 +340,11 @@ pub async fn fetch_etsy_orders() -> Result<Vec<Order>, String> {
                 .filter_map(|t| t.expected_ship_date)
                 .max()
                 .and_then(|ts| {
-                    let dt = if ts > 1_000_000_000_000 {
+                    if ts > 1_000_000_000_000 {
                         Utc.timestamp_millis_opt(ts).single()
                     } else {
                         Utc.timestamp_opt(ts, 0).single()
-                    };
-                    dt
+                    }
                 })
                 .unwrap_or_else(|| order_date + Duration::days(14));
 
@@ -399,16 +402,6 @@ pub async fn fetch_etsy_orders() -> Result<Vec<Order>, String> {
                             s.to_lowercase().contains("ring") || s.to_lowercase().contains("size")
                         })
                         .cloned();
-                    
-                    // let ring_size = if let Some(sz) = size {
-                    //     if sz.to_lowercase().contains("ring size: ") {
-                    //         Some(sz.split("ring size: ").nth(1).unwrap_or("").trim().to_string())
-                    //     } else {
-                    //         Some(sz)
-                    //     }
-                    // } else {
-                    //     size
-                    // };
 
                     let image_url = t
                         .listing_id
