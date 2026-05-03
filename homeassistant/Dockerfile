@@ -14,8 +14,18 @@ RUN apt-get update && apt-get install -y \
 RUN cargo install dioxus-cli
 
 WORKDIR /build
-# Shallow clone of default branch (Supervisor context is only homeassistant/, not repo root).
-RUN git clone --depth 1 "${GIT_URL}" .
+
+# Bust BuildKit cache when this folder changes on disk after "Update" / git pull in the store.
+# (Rust sources are not in the build context — only GitHub — so Dockerfile/config bumps matter.)
+COPY Dockerfile /tmp/addon.Dockerfile
+COPY config.yaml /tmp/addon.config.yaml
+
+# Supervisor passes these (see build logs). Changing `version:` in config.yaml invalidates the clone layer.
+ARG BUILD_VERSION=0.0.0
+ARG BUILD_ARCH=amd64
+
+RUN echo "Order Tracker build ${BUILD_VERSION} (${BUILD_ARCH})" \
+    && git clone --depth 1 "${GIT_URL}" .
 
 RUN touch .env
 # Avoid wasm-opt + DWARF SIGABRT on HA builders; same-path optimize can corrupt wasm on failure.
