@@ -1,4 +1,3 @@
-ARG BUILD_FROM
 FROM rust:1-bookworm AS builder
 
 # Install build dependencies
@@ -32,11 +31,13 @@ RUN dx build --release --platform web
 
 # ---------------------------------------------------------------------------
 # Runtime stage
-# ---------------------------------------------------------------------------
-FROM $BUILD_FROM
+# Supervisor 2026.04+ no longer injects BUILD_FROM — use an explicit HA base.
+# base-debian matches the glibc/Rust bookworm builder; includes s6 + bashio for run.sh.
+# https://developers.home-assistant.io/docs/apps/configuration/#app-dockerfile
+# https://github.com/home-assistant/docker-base#debian-images
+FROM ghcr.io/home-assistant/base-debian:bookworm
 
-# Install runtime deps (OpenSSL)
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
     && rm -rf /var/lib/apt/lists/*
