@@ -1,0 +1,4 @@
+# https://developers.home-assistant.io/docs/apps/repository#repository-configuration
+name: Order Tracker app
+url: "https://github.com/shadowbrok3r/OrderTracker"
+maintainer: "shadowbrok3r"
