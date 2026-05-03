@@ -18,7 +18,8 @@ WORKDIR /build
 RUN git clone --depth 1 "${GIT_URL}" .
 
 RUN touch .env
-RUN dx build --release --platform web
+# Avoid wasm-opt + DWARF SIGABRT on HA builders; same-path optimize can corrupt wasm on failure.
+RUN dx build --release --platform web --debug-symbols false
 
 # ---------------------------------------------------------------------------
 # Runtime stage

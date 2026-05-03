@@ -1,4 +1,4 @@
-#!/usr/bin/with-contenv bashio
+#!/command/with-contenv bashio
 
 # Read add-on options and export as environment variables
 CONFIG_PATH=/data/options.json
