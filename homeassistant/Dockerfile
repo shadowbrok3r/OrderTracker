@@ -34,7 +34,8 @@ WORKDIR /app
 
 COPY --from=builder /build/target/dx/order_tracker/release/web/server /app/order_tracker
 COPY --from=builder /build/target/dx/order_tracker/release/web/public /app/public
-COPY --from=builder /build/homeassistant/run.sh /run.sh
-RUN chmod a+x /run.sh
 
-CMD [ "/run.sh" ]
+# s6-overlay supervises long-running apps under /etc/services.d/<name>/run so Stop/Restart
+# from Supervisor sends SIGTERM to order_tracker. CMD+exec alone is not a tracked service.
+COPY rootfs /
+RUN chmod a+x /etc/services.d/order-tracker/run
