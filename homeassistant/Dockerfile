@@ -1,40 +1,27 @@
+# Supervisor's build context is only this app folder, not the monorepo root.
+# Fetch the full tree so Cargo.toml, src/, assets/ are available (public clone).
 FROM rust:1-bookworm AS builder
 
-# Install build dependencies
+# Override at build time if you fork: docker build --build-arg GIT_URL=https://github.com/you/OrderTracker.git
+ARG GIT_URL=https://github.com/shadowbrok3r/OrderTracker.git
+
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
-# Install dx CLI for building the fullstack app
 RUN cargo install dioxus-cli
 
 WORKDIR /build
+# Shallow clone of default branch (Supervisor context is only homeassistant/, not repo root).
+RUN git clone --depth 1 "${GIT_URL}" .
 
-# Copy manifests first for dependency caching
-COPY Cargo.toml Cargo.lock* build.rs ./
-COPY Dioxus.toml ./
-
-# Create a dummy main.rs so cargo can fetch deps
-RUN mkdir -p src && echo "fn main() {}" > src/main.rs
-RUN cargo fetch
-
-# Copy the full source and assets
-COPY src/ src/
-COPY assets/ assets/
-
-# Create a dummy .env so build.rs doesn't warn
 RUN touch .env
-
-# Build the fullstack web app (server binary + WASM client bundle)
 RUN dx build --release --platform web
 
 # ---------------------------------------------------------------------------
 # Runtime stage
-# Supervisor 2026.04+ no longer injects BUILD_FROM — use an explicit HA base.
-# base-debian matches the glibc/Rust bookworm builder; includes s6 + bashio for run.sh.
-# https://developers.home-assistant.io/docs/apps/configuration/#app-dockerfile
-# https://github.com/home-assistant/docker-base#debian-images
 FROM ghcr.io/home-assistant/base-debian:bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -44,12 +31,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Copy the built server binary and static assets from the builder
 COPY --from=builder /build/target/dx/order_tracker/release/web/server /app/order_tracker
 COPY --from=builder /build/target/dx/order_tracker/release/web/public /app/public
-
-# Copy the run script
-COPY homeassistant/run.sh /run.sh
+COPY --from=builder /build/homeassistant/run.sh /run.sh
 RUN chmod a+x /run.sh
 
 CMD [ "/run.sh" ]
