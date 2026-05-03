@@ -45,7 +45,40 @@ fn main() {
     {
         dotenvy::dotenv().ok();
     }
+    #[cfg(target_arch = "wasm32")]
+    init_ha_ingress_server_url_for_fullstack();
     dioxus::launch(App);
+}
+
+/// Home Assistant Ingress serves this UI at `https://<host>/app/<slug>/…`.
+/// Dioxus server functions default to `/api/…` on the host root, which misses Ingress and
+/// breaks behind HA (502 / empty UI). Point the client at `origin + /app/<slug>` instead.
+#[cfg(target_arch = "wasm32")]
+fn init_ha_ingress_server_url_for_fullstack() {
+    use dioxus::fullstack::set_server_url;
+
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Ok(pathname) = window.location().pathname() else {
+        return;
+    };
+    let Ok(origin) = window.location().origin() else {
+        return;
+    };
+
+    let segments: Vec<&str> = pathname
+        .trim_end_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    if segments.len() < 2 || segments[0] != "app" {
+        return;
+    }
+    let slug = segments[1];
+    let base = format!("{origin}/app/{slug}");
+    let leaked: &'static str = Box::leak(base.into_boxed_str());
+    set_server_url(leaked);
 }
 
 #[component]

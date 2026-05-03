@@ -4706,6 +4706,7 @@ dependencies = [
  "surrealdb",
  "surrealdb-types",
  "tokio",
+ "web-sys",
 ]
 
 [[package]]

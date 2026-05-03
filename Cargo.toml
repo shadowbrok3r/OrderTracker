@@ -25,5 +25,8 @@ server = ["dioxus/server", "dep:tokio", "dep:reqwest", "dep:surrealdb", "dep:sur
 web = ["dioxus/web"]
 desktop = ["dioxus/desktop"]
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { version = "0.3", features = ["Window", "Location"] }
+
 [build-dependencies]
 dotenvy = "0.15.7"
