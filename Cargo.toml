@@ -9,7 +9,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 dioxus-primitives = { git = "https://github.com/DioxusLabs/components", version = "0.0.1", default-features = false }
-jewelry_shared = { path = "../jewelry_shared", default-features = false }
+jewelry_shared = { path = "jewelry_shared", default-features = false }
 
 # Server-only deps (not WASM-compatible)
 tokio = { version = "1", features = ["full"], optional = true }

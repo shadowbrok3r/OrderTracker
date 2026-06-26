@@ -1,0 +1,16 @@
+[package]
+name = "jewelry_shared"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# surrealdb-types provides the SurrealValue derive; its 3.1.4 expansion references
+# the `surrealdb` crate, so both are pulled in under the feature.
+surrealdb = { version = "3.1.4", optional = true }
+surrealdb-types = { version = "3.1.4", optional = true }
+
+[features]
+default = []
+# Adds the SurrealValue derive so the row can be bound/selected via SurrealDB.
+surreal = ["dep:surrealdb", "dep:surrealdb-types"]
