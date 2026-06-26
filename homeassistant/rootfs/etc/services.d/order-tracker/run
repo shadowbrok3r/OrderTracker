@@ -15,5 +15,8 @@ else
     bashio::log.warning "No options.json found at $CONFIG_PATH"
 fi
 
-bashio::log.info "Starting Order Tracker on port 8099..."
-exec /app/order_tracker --addr 0.0.0.0 --port 8099
+bashio::log.info "Starting Order Tracker on 0.0.0.0:8099..."
+# dioxus::launch binds from the IP/PORT env vars; it ignores CLI --addr/--port.
+export IP="0.0.0.0"
+export PORT="8099"
+exec /app/order_tracker
