@@ -457,6 +457,7 @@ fn App() -> Element {
                                         th { "Days Left" }
                                         th { "Total" }
                                         th { title: "Our cost (from catalog)", "Cost" }
+                                        th { title: "Sale price minus our cost", "Margin" }
                                         th { title: "Weight (g)", "Weight" }
                                         th { "Source" }
                                     }
@@ -567,6 +568,15 @@ fn OrderRow(
         "\u{2014}".to_string()
     };
 
+    let (margin_str, margin_class) = if order_cost > 0.0 && order.total_price > 0.0 {
+        let margin = order.total_price - order_cost;
+        let pct = margin / order.total_price * 100.0;
+        let color = if margin < 0.0 { "text-warning-red" } else { "text-alien-green" };
+        (format!("$ {:.2} ({:.0}%)", margin, pct), format!("td-nowrap font-semibold {color}"))
+    } else {
+        ("\u{2014}".to_string(), "td-nowrap text-stardust".to_string())
+    };
+
     rsx! {
         tr {
             class: "{urgency_class} order-row-clickable",
@@ -629,6 +639,7 @@ fn OrderRow(
                 {format!("$ {:.2}", order.total_price)}
             }
             td { class: "td-nowrap text-stardust", title: "Our cost (from catalog)", "{cost_str}" }
+            td { class: "{margin_class}", title: "Sale price minus our cost", "{margin_str}" }
             td { class: "td-nowrap text-stardust", title: "Weight (g)", "{weight_str}" }
             td { class: "td-nowrap",
                 {
@@ -708,9 +719,15 @@ fn OrderDetailDialog(
                 .sum();
             if order_cost > 0.0 {
                 let s = format!("$ {:.2}", order_cost);
+                let margin = order.total_price - order_cost;
+                let pct = if order.total_price > 0.0 { margin / order.total_price * 100.0 } else { 0.0 };
+                let margin_s = format!("$ {:.2} ({:.0}%)", margin, pct);
+                let margin_color = if margin < 0.0 { "font-semibold text-warning-red" } else { "font-semibold text-alien-green" };
                 rsx! {
                     dt { "Our cost" }
                     dd { class: "font-semibold text-aurora-purple", "{s}" }
+                    dt { "Margin" }
+                    dd { class: "{margin_color}", "{margin_s}" }
                 }
             } else {
                 rsx! { }
@@ -746,6 +763,13 @@ fn OrderDetailItemRow(item: OrderItem, cost_weight: Option<ItemCostWeight>) -> E
         ),
         None => ("\u{2014}".to_string(), "\u{2014}".to_string()),
     };
+    let margin_str = match &cost_weight {
+        Some(cw) => {
+            let qty = item.quantity as f64;
+            format!("${:.2}", item.price * qty - cw.cost_usd * qty)
+        }
+        None => "\u{2014}".to_string(),
+    };
     rsx! {
         div { class: "flex items-start gap-3 p-3 rounded-lg bg-nebula-dark/50 border border-nebula-purple/20",
             {item.image_url.as_ref().map(|url| rsx! {
@@ -760,7 +784,7 @@ fn OrderDetailItemRow(item: OrderItem, cost_weight: Option<ItemCostWeight>) -> E
                 {item.ring_size.as_ref().map(|s| rsx! { p { class: "text-aurora-purple text-sm font-mono", "Size: {s}" } })}
                 p { class: "text-moonlight text-sm", "{item.metal_type.display_name()} | {price_str}" }
                 p { class: "text-stardust text-sm mt-1",
-                    "Our cost: {cost_str} | Weight: {weight_str}"
+                    "Our cost: {cost_str} | Margin: {margin_str} | Weight: {weight_str}"
                 }
             }
         }

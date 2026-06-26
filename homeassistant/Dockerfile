@@ -9,9 +9,17 @@ RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
     git \
+    curl \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN cargo install dioxus-cli
+# Install the dx CLI from a prebuilt binary via cargo-binstall.
+# Avoids `cargo install dioxus-cli` re-resolving git2 0.21 (which dropped Cred::credential_helper
+# and breaks auth-git2 0.5.8), and skips compiling ~400 crates on the HA builder.
+# Pin dx to match the `dioxus = "0.7"` library dependency.
+RUN curl -L --proto '=https' --tlsv1.2 -sSf \
+      https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash \
+ && cargo binstall -y dioxus-cli@0.7.9
 
 WORKDIR /build
 

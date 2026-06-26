@@ -3,6 +3,7 @@
 
 use std::sync::LazyLock;
 use surrealdb::engine::remote::ws::{Client, Ws, Wss};
+use surrealdb::opt::auth::Root;
 use surrealdb::Surreal;
 
 const NS: &str = "jewelry_calculator";
@@ -33,6 +34,14 @@ pub async fn ensure_db_init() -> Result<(), String> {
                 Err(e) => eprintln!("Failed connecting to {}: {:?}", url, e),
             }
             connect_result.map_err(|e| e.to_string())?;
+            if let (Ok(user), Ok(pass)) =
+                (std::env::var("SURREAL_USER"), std::env::var("SURREAL_PASS"))
+            {
+                DB.signin(Root { username: user.clone(), password: pass })
+                    .await
+                    .map_err(|e| e.to_string())?;
+                eprintln!("Signed in to SurrealDB as {}", user);
+            }
             DB.use_ns(NS).use_db(DB_NAME).await.map_err(|e| e.to_string())?;
             eprintln!("Using NS: {}, DB: {}", NS, DB_NAME);
             Ok(())

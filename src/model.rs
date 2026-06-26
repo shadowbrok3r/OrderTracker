@@ -3,8 +3,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "server")]
-use surrealdb_types::SurrealValue;
+pub use jewelry_shared::PieceCostRow;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MetalType {
@@ -104,23 +103,6 @@ pub struct OrderItem {
 // ---------------------------------------------------------------------------
 // Piece cost types & matching (shared between server DB logic and client UI)
 // ---------------------------------------------------------------------------
-
-/// One row from piece_costs table.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "server", derive(SurrealValue))]
-pub struct PieceCostRow {
-    pub design_key: String,
-    pub ring_size: Option<String>,
-    pub volume_cm3: Option<f64>,
-    pub silver_g: Option<f64>,
-    pub silver_usd: Option<f64>,
-    pub gold_g: Option<f64>,
-    pub gold_usd: Option<f64>,
-    pub bronze_g: Option<f64>,
-    pub bronze_usd: Option<f64>,
-    pub wax_usd: Option<f64>,
-    pub product_keys: Option<Vec<String>>,
-}
 
 /// Resolved cost and weight for an order item (for display).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
