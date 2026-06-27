@@ -5109,6 +5109,7 @@ dependencies = [
  "surrealdb",
  "surrealdb-types",
  "tokio",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",

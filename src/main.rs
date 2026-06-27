@@ -65,9 +65,10 @@ fn server_main() {
         http::{header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE}, Uri},
         middleware::{self, Next},
         response::Response,
-        Router,
+        Router, ServiceExt,
     };
     use dioxus::server::{DioxusRouterExt, ServeConfig};
+    use tower::Layer;
     use tower_http::trace::TraceLayer;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -151,10 +152,13 @@ fn server_main() {
         };
         let text = String::from_utf8_lossy(&bytes);
         let rewritten = if is_html {
-            text.replacen("<head>", &format!("<head><base href=\"{ingress}/\">"), 1)
+            // The ingress prefix starts with /api/, so the /api/ and base-href
+            // rewrites would re-match each other's output: run path rewrites
+            // first, inject the base href last.
+            text.replace("=\"/api/", &format!("=\"{ingress}/api/"))
                 .replace("=\"/./assets/", &format!("=\"{ingress}/assets/"))
                 .replace("=\"/assets/", &format!("=\"{ingress}/assets/"))
-                .replace("=\"/api/", &format!("=\"{ingress}/api/"))
+                .replacen("<head>", &format!("<head><base href=\"{ingress}/\">"), 1)
         } else {
             // JS and CSS: prefix every absolute asset path (incl. the wasm loader's).
             text.replace("/./assets/", &format!("{ingress}/assets/"))
@@ -179,15 +183,19 @@ fn server_main() {
             let app: Router = Router::new()
                 .serve_dioxus_application(ServeConfig::new(), App)
                 .layer(middleware::from_fn(rewrite_ingress_assets))
-                .layer(middleware::from_fn(strip_ingress_prefix))
                 .layer(TraceLayer::new_for_http());
+
+            // Wrap the whole Router so strip runs before routing; Router::layer runs after.
+            let app = middleware::from_fn(strip_ingress_prefix).layer(app);
 
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
                 .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
             tracing::info!(%addr, "OrderTracker server listening");
 
-            axum::serve(listener, app).await.expect("axum server error");
+            axum::serve(listener, app.into_make_service())
+                .await
+                .expect("axum server error");
         });
 }
 
