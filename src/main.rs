@@ -62,7 +62,7 @@ fn server_main() {
         self,
         body::{to_bytes, Body},
         extract::Request,
-        http::header::{CONTENT_LENGTH, CONTENT_TYPE},
+        http::{header::{CONTENT_LENGTH, CONTENT_TYPE}, Uri},
         middleware::{self, Next},
         response::Response,
         Router,
@@ -81,7 +81,35 @@ fn server_main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // Prefix absolute asset/api URLs in SSR HTML with the per-session HA ingress path.
+    // Strip the per-session HA ingress prefix from the request path so the inner
+    // router (static assets + server fns) matches normally. No-op when HA already
+    // stripped it or there is no ingress header (direct access).
+    async fn strip_ingress_prefix(mut req: Request, next: Next) -> Response {
+        if let Some(prefix) = req
+            .headers()
+            .get("x-ingress-path")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty())
+        {
+            let path = req.uri().path();
+            if let Some(rest) = path.strip_prefix(&prefix) {
+                let rest = if rest.is_empty() { "/" } else { rest };
+                let pq = match req.uri().query() {
+                    Some(q) => format!("{rest}?{q}"),
+                    None => rest.to_string(),
+                };
+                if let Ok(uri) = pq.parse::<Uri>() {
+                    tracing::debug!(from = %path, to = %rest, "strip ingress prefix");
+                    *req.uri_mut() = uri;
+                }
+            }
+        }
+        next.run(req).await
+    }
+
+    // Rewrite absolute asset/api URLs in SSR HTML, the wasm-loader JS, and CSS so
+    // the browser requests them through the per-session HA ingress path.
     async fn rewrite_ingress_assets(req: Request, next: Next) -> Response {
         let ingress = req
             .headers()
@@ -95,13 +123,16 @@ fn server_main() {
         let Some(ingress) = ingress else {
             return res;
         };
-        let is_html = res
+        let ctype = res
             .headers()
             .get(CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .map(|c| c.starts_with("text/html"))
-            .unwrap_or(false);
-        if !is_html {
+            .unwrap_or("")
+            .to_string();
+        let is_html = ctype.starts_with("text/html");
+        let is_js = ctype.contains("javascript");
+        let is_css = ctype.starts_with("text/css");
+        if !(is_html || is_js || is_css) {
             return res;
         }
 
@@ -110,12 +141,21 @@ fn server_main() {
             Ok(b) => b,
             Err(_) => return Response::from_parts(parts, Body::empty()),
         };
-        let html = String::from_utf8_lossy(&bytes);
-        let rewritten = html
-            .replacen("<head>", &format!("<head><base href=\"{ingress}/\">"), 1)
-            .replace("=\"/./assets/", &format!("=\"{ingress}/assets/"))
-            .replace("=\"/assets/", &format!("=\"{ingress}/assets/"))
-            .replace("=\"/api/", &format!("=\"{ingress}/api/"));
+        let text = String::from_utf8_lossy(&bytes);
+        let rewritten = if is_html {
+            text.replacen("<head>", &format!("<head><base href=\"{ingress}/\">"), 1)
+                .replace("=\"/./assets/", &format!("=\"{ingress}/assets/"))
+                .replace("=\"/assets/", &format!("=\"{ingress}/assets/"))
+                .replace("=\"/api/", &format!("=\"{ingress}/api/"))
+        } else if is_js {
+            text.replace("/./assets/", &format!("{ingress}/assets/"))
+                .replace("\"/assets/", &format!("\"{ingress}/assets/"))
+                .replace("'/assets/", &format!("'{ingress}/assets/"))
+        } else {
+            text.replace("url(/assets/", &format!("url({ingress}/assets/"))
+                .replace("url(\"/assets/", &format!("url(\"{ingress}/assets/"))
+                .replace("url('/assets/", &format!("url('{ingress}/assets/"))
+        };
 
         parts.headers.remove(CONTENT_LENGTH);
         Response::from_parts(parts, Body::from(rewritten))
@@ -132,6 +172,7 @@ fn server_main() {
             let app: Router = Router::new()
                 .serve_dioxus_application(ServeConfig::new(), App)
                 .layer(middleware::from_fn(rewrite_ingress_assets))
+                .layer(middleware::from_fn(strip_ingress_prefix))
                 .layer(TraceLayer::new_for_http());
 
             let listener = tokio::net::TcpListener::bind(addr)
