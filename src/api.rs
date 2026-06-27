@@ -131,3 +131,12 @@ pub async fn create_custom_order(order: Order) -> Result<(), ServerFnError> {
         .await
         .map_err(|e| ServerFnError::new(e))
 }
+
+/// Update an existing custom order (e.g. set the charge / line items).
+#[server]
+pub async fn update_custom_order(order: Order) -> Result<(), ServerFnError> {
+    crate::db::ensure_db_init().await.map_err(|e| ServerFnError::new(e))?;
+    crate::db::update_custom_order(&order)
+        .await
+        .map_err(|e| ServerFnError::new(e))
+}

@@ -290,6 +290,19 @@ pub async fn save_custom_order(order: &Order) -> Result<(), String> {
     Ok(())
 }
 
+/// Replace an existing custom order's payload (id = custom_orders record key).
+pub async fn update_custom_order(order: &Order) -> Result<(), String> {
+    let payload = CachedOrder::from_order(order);
+    DB.query("UPDATE type::record('custom_orders', $key) SET payload = $payload")
+        .bind(("key", order.id.clone()))
+        .bind(("payload", payload))
+        .await
+        .map_err(|e| e.to_string())?
+        .check()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Merge live/cached Shopify+Etsy orders with custom orders, then apply the
 /// archive/complete overlay from order_state.
 pub async fn merge_orders(mut base: Vec<Order>) -> Vec<Order> {

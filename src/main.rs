@@ -46,6 +46,31 @@ enum SortBy {
     Customer,
 }
 
+/// A pickable product in the New Order builder: a catalog piece or a name reused
+/// from a past custom order.
+#[derive(Clone, PartialEq)]
+struct ProductOption {
+    name: String,
+    kind: String,
+    sizes: Vec<String>,
+    image_url: Option<String>,
+    catalog: bool,
+}
+
+/// One in-progress line item in the New Order builder.
+#[derive(Clone, PartialEq)]
+struct DraftLine {
+    name: String,
+    kind: String,
+    catalog: bool,
+    sizes: Vec<String>,
+    size: String,
+    metal: String,
+    qty: u32,
+    price: String,
+    image_url: Option<String>,
+}
+
 // ============================================================================
 // Entry & root component
 // ============================================================================
@@ -285,10 +310,8 @@ fn App() -> Element {
     let mut catalog = use_signal(|| Vec::<CatalogPiece>::new());
     let mut custom_open = use_signal(|| false);
     let mut cf_customer = use_signal(String::new);
-    let mut cf_item = use_signal(String::new);
-    let mut cf_size = use_signal(String::new);
-    let mut cf_metal = use_signal(|| "Silver".to_string());
-    let mut cf_charge = use_signal(String::new);
+    let mut cf_search = use_signal(String::new);
+    let mut cf_lines = use_signal(Vec::<DraftLine>::new);
     let mut cf_due = use_signal(String::new);
     let mut cf_msg = use_signal(|| None::<String>);
 
@@ -388,6 +411,75 @@ fn App() -> Element {
             .iter()
             .map(|o| (o.clone(), o.clone()))
             .collect::<Vec<(Order, Order)>>()
+    });
+
+    // Products pickable in the New Order builder: every catalog piece, plus any
+    // distinct product name reused from a past custom order. Each carries a
+    // representative thumbnail from a prior order so re-orders show an image.
+    let product_options = use_memo(move || {
+        let cat = catalog.read();
+        let ords = orders.read();
+        let mut opts: Vec<ProductOption> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for p in cat.iter() {
+            let key = compact(&p.name);
+            if key.is_empty() || !seen.insert(key) {
+                continue;
+            }
+            let mut sizes: Vec<String> =
+                p.sizes.iter().filter_map(|s| s.ring_size.clone()).collect();
+            sizes.sort_by(|a, b| {
+                ring_num(&Some(a.clone()))
+                    .partial_cmp(&ring_num(&Some(b.clone())))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            sizes.dedup();
+            opts.push(ProductOption {
+                image_url: find_thumb(&ords, &p.name, &None),
+                name: p.name.clone(),
+                kind: p.kind.clone(),
+                sizes,
+                catalog: true,
+            });
+        }
+        for o in ords.iter() {
+            if !matches!(o.source, OrderSource::Custom) {
+                continue;
+            }
+            for it in o.items.iter() {
+                let key = compact(&it.name);
+                if key.is_empty() || !seen.insert(key) {
+                    continue;
+                }
+                opts.push(ProductOption {
+                    name: it.name.clone(),
+                    kind: String::new(),
+                    sizes: Vec::new(),
+                    image_url: it.image_url.clone(),
+                    catalog: false,
+                });
+            }
+        }
+        opts.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        opts
+    });
+
+    let product_filtered = use_memo(move || {
+        let q = cf_search.read().to_lowercase();
+        product_options
+            .read()
+            .iter()
+            .filter(|o| q.is_empty() || o.name.to_lowercase().contains(&q))
+            .cloned()
+            .collect::<Vec<ProductOption>>()
+    });
+
+    let draft_total = use_memo(move || {
+        cf_lines
+            .read()
+            .iter()
+            .map(|l| l.price.trim().parse::<f64>().unwrap_or(0.0) * l.qty.max(1) as f64)
+            .sum::<f64>()
     });
 
     let silver_txt = format!("{:.0} g Ag to buy", silver_needed());
@@ -558,81 +650,143 @@ fn App() -> Element {
                         div {
                             class: "card-cosmic p-6 max-w-lg w-full mx-4 max-h-[90vh] overflow-y-auto",
                             onclick: move |evt| { evt.stop_propagation(); },
-                            h2 { class: "text-xl font-bold text-star-white mb-4", "New custom order" }
+                            h2 { class: "text-xl font-bold text-star-white mb-4", "New order" }
                             div { class: "space-y-3",
-                                input {
-                                    r#type: "text", class: "w-full", placeholder: "Customer name",
-                                    value: "{cf_customer}", oninput: move |e| cf_customer.set(e.value())
-                                }
-                                input {
-                                    r#type: "text", class: "w-full", placeholder: "Item / description",
-                                    value: "{cf_item}", oninput: move |e| cf_item.set(e.value())
-                                }
                                 div { class: "flex gap-2",
                                     input {
-                                        r#type: "text", class: "w-full", placeholder: "Ring size (e.g. 9)",
-                                        value: "{cf_size}", oninput: move |e| cf_size.set(e.value())
-                                    }
-                                    select {
-                                        class: "bg-nebula-dark border border-nebula-purple rounded-lg px-3 py-2",
-                                        onchange: move |e| cf_metal.set(e.value()),
-                                        option { value: "Silver", "Silver" }
-                                        option { value: "Gold Plated", "Gold Plated" }
-                                        option { value: "Bronze", "Bronze" }
-                                    }
-                                }
-                                div { class: "flex gap-2",
-                                    input {
-                                        r#type: "number", class: "w-full", placeholder: "Charge (USD)",
-                                        value: "{cf_charge}", oninput: move |e| cf_charge.set(e.value())
+                                        r#type: "text", class: "w-full", placeholder: "Customer name",
+                                        value: "{cf_customer}", oninput: move |e| cf_customer.set(e.value())
                                     }
                                     input {
                                         r#type: "date", class: "w-full",
                                         value: "{cf_due}", oninput: move |e| cf_due.set(e.value())
                                     }
                                 }
+
+                                div {
+                                    input {
+                                        r#type: "search", class: "w-full",
+                                        placeholder: "Search a product to add (Marines MC, Hades, ...)",
+                                        value: "{cf_search}", oninput: move |e| cf_search.set(e.value())
+                                    }
+                                    div { class: "product-picker mt-2",
+                                        for opt in product_filtered.read().iter().cloned() {
+                                            button {
+                                                class: "product-option", r#type: "button",
+                                                onclick: {
+                                                    let opt = opt.clone();
+                                                    move |_| {
+                                                        let o = opt.clone();
+                                                        let default_size = o.sizes.first().cloned().unwrap_or_default();
+                                                        cf_lines.write().push(DraftLine {
+                                                            name: o.name,
+                                                            kind: o.kind,
+                                                            catalog: o.catalog,
+                                                            sizes: o.sizes,
+                                                            size: default_size,
+                                                            metal: "Silver".to_string(),
+                                                            qty: 1,
+                                                            price: String::new(),
+                                                            image_url: o.image_url,
+                                                        });
+                                                    }
+                                                },
+                                                {opt.image_url.as_ref().map(|url| rsx! {
+                                                    img { class: "order-thumb", src: "{url}", alt: "" }
+                                                })}
+                                                span { class: "po-name", "{opt.name}" }
+                                                span { class: "po-meta",
+                                                    {if opt.catalog {
+                                                        if opt.sizes.is_empty() { opt.kind.clone() }
+                                                        else { format!("{} \u{00b7} {} sizes", opt.kind, opt.sizes.len()) }
+                                                    } else { "custom".to_string() }}
+                                                }
+                                            }
+                                        }
+                                    }
+                                    button {
+                                        class: "btn-cosmic mt-2", r#type: "button",
+                                        onclick: move |_| cf_lines.write().push(DraftLine {
+                                            name: String::new(), kind: String::new(), catalog: false,
+                                            sizes: Vec::new(), size: String::new(), metal: "Silver".to_string(),
+                                            qty: 1, price: String::new(), image_url: None,
+                                        }),
+                                        "+ Custom item"
+                                    }
+                                }
+
+                                {if cf_lines.read().is_empty() {
+                                    rsx! { p { class: "text-stardust text-sm", "No items yet \u{2014} pick a product or add a custom item." } }
+                                } else {
+                                    rsx! {
+                                        div { class: "space-y-3",
+                                            for (i, line) in cf_lines.read().iter().cloned().enumerate() {
+                                                DraftLineRow { index: i, line, lines: cf_lines }
+                                            }
+                                        }
+                                    }
+                                }}
+
+                                div { class: "flex items-center justify-between mt-2",
+                                    span { class: "text-stardust text-sm", "Total charge" }
+                                    span { class: "text-star-white font-semibold", {format!("$ {:.2}", draft_total())} }
+                                }
+
                                 {if let Some(m) = cf_msg.read().as_ref() {
                                     rsx! { p { class: "text-warning-red text-sm", "{m}" } }
                                 } else { rsx! {} }}
+
                                 div { class: "flex gap-2 mt-2 justify-end",
                                     button { class: "btn-cosmic", onclick: move |_| custom_open.set(false), "Cancel" }
                                     button {
                                         class: "btn-nebula",
                                         onclick: move |_| {
                                             let customer = cf_customer.read().trim().to_string();
-                                            let item = cf_item.read().trim().to_string();
-                                            if customer.is_empty() || item.is_empty() {
-                                                cf_msg.set(Some("Customer and item are required.".to_string()));
+                                            let lines = cf_lines.read().clone();
+                                            if customer.is_empty() {
+                                                cf_msg.set(Some("Customer name is required.".to_string()));
                                                 return;
                                             }
-                                            let charge: f64 = cf_charge.read().trim().parse().unwrap_or(0.0);
-                                            let size = {
-                                                let s = cf_size.read().trim().to_string();
-                                                if s.is_empty() { None } else { Some(format!("{} US", s)) }
-                                            };
-                                            let metal = MetalType::from_string(&cf_metal.read());
+                                            if lines.is_empty() {
+                                                cf_msg.set(Some("Add at least one product.".to_string()));
+                                                return;
+                                            }
+                                            if lines.iter().any(|l| l.name.trim().is_empty()) {
+                                                cf_msg.set(Some("Every item needs a name.".to_string()));
+                                                return;
+                                            }
                                             let due = NaiveDate::parse_from_str(cf_due.read().trim(), "%Y-%m-%d")
                                                 .ok()
                                                 .and_then(|d| d.and_hms_opt(0, 0, 0))
                                                 .map(|dt| DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc))
                                                 .unwrap_or_else(|| Utc::now() + Duration::days(14));
+                                            let ords = orders.read().clone();
+                                            let items: Vec<OrderItem> = lines.iter().map(|l| {
+                                                let size = normalize_size(&l.size, l.catalog);
+                                                let price = l.price.trim().parse::<f64>().unwrap_or(0.0);
+                                                let metal = MetalType::from_string(&l.metal);
+                                                let image_url = l.image_url.clone()
+                                                    .or_else(|| find_thumb(&ords, &l.name, &size));
+                                                OrderItem {
+                                                    name: l.name.trim().to_string(),
+                                                    quantity: l.qty.max(1),
+                                                    price,
+                                                    metal_type: metal,
+                                                    ring_size: size,
+                                                    variant_info: None,
+                                                    image_url,
+                                                }
+                                            }).collect();
+                                            let total: f64 = items.iter().map(|i| i.price * i.quantity as f64).sum();
                                             let order = Order {
                                                 id: String::new(),
                                                 source: OrderSource::Custom,
                                                 order_number: "Custom".to_string(),
                                                 customer_name: customer,
-                                                items: vec![OrderItem {
-                                                    name: item,
-                                                    quantity: 1,
-                                                    price: charge,
-                                                    metal_type: metal,
-                                                    ring_size: size,
-                                                    variant_info: None,
-                                                    image_url: None,
-                                                }],
+                                                items,
                                                 order_date: Utc::now(),
                                                 due_date: due,
-                                                total_price: charge,
+                                                total_price: total,
                                                 currency: "USD".to_string(),
                                                 status: "open".to_string(),
                                                 shipping_address: None,
@@ -644,9 +798,8 @@ fn App() -> Element {
                                                     Ok(()) => {
                                                         custom_open.set(false);
                                                         cf_customer.set(String::new());
-                                                        cf_item.set(String::new());
-                                                        cf_size.set(String::new());
-                                                        cf_charge.set(String::new());
+                                                        cf_search.set(String::new());
+                                                        cf_lines.set(Vec::new());
                                                         cf_due.set(String::new());
                                                         cf_msg.set(None);
                                                         if let Ok(result) = api::fetch_all_orders().await {
@@ -707,7 +860,7 @@ fn App() -> Element {
                     }
                 },
                 DialogContent {
-                    class: "max-w-2xl max-h-[90vh] overflow-y-auto",
+                    class: "max-w-2xl flex flex-col max-h-[90vh]",
                     {if let Some(order) = detail_order.read().as_ref() {
                         rsx! {
                             OrderDetailDialog {
@@ -729,6 +882,26 @@ fn App() -> Element {
                                         }
                                     }
                                     detail_order.set(None);
+                                },
+                                on_set_charge: move |(id, total): (String, f64)| {
+                                    let mut updated: Option<Order> = None;
+                                    {
+                                        let mut os = orders.write();
+                                        if let Some(o) = os.iter_mut()
+                                            .find(|o| matches!(o.source, OrderSource::Custom) && o.id == id)
+                                        {
+                                            o.total_price = total;
+                                            updated = Some(o.clone());
+                                        }
+                                    }
+                                    if let Some(o) = updated {
+                                        detail_order.set(Some(o.clone()));
+                                        spawn(async move {
+                                            if let Err(e) = api::update_custom_order(o).await {
+                                                log::app_log("ERROR", format!("Update custom order: {}", e));
+                                            }
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -869,6 +1042,51 @@ fn ring_num(s: &Option<String>) -> f64 {
             digits.trim_matches('.').parse().unwrap_or(0.0)
         })
         .unwrap_or(0.0)
+}
+
+/// Lowercased alphanumeric-only form for loose product-name matching.
+fn compact(s: &str) -> String {
+    s.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect()
+}
+
+/// Best existing thumbnail for a product name + size, so re-orders inherit the
+/// thumbnail cached on a prior matching order. Prefers an exact size match.
+fn find_thumb(orders: &[Order], name: &str, size: &Option<String>) -> Option<String> {
+    let nk = compact(name);
+    if nk.is_empty() {
+        return None;
+    }
+    let want = ring_num(size);
+    let mut fallback = None;
+    for o in orders {
+        for it in &o.items {
+            let Some(img) = it.image_url.as_ref() else { continue };
+            let ik = compact(&it.name);
+            if ik.is_empty() || !(ik == nk || ik.contains(&nk) || nk.contains(&ik)) {
+                continue;
+            }
+            if fallback.is_none() {
+                fallback = Some(img.clone());
+            }
+            if want > 0.0 && (ring_num(&it.ring_size) - want).abs() < 0.01 {
+                return Some(img.clone());
+            }
+        }
+    }
+    fallback
+}
+
+/// Catalog sizes are stored already-formatted ("US 9"); custom free-text sizes
+/// are normalized to "{n} US" when numeric, else kept verbatim.
+fn normalize_size(raw: &str, catalog: bool) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if catalog {
+        return Some(s.to_string());
+    }
+    model::format_ring_size(s).or_else(|| Some(s.to_string()))
 }
 
 #[component]
@@ -1143,6 +1361,7 @@ fn OrderDetailDialog(
     catalog: Vec<CatalogPiece>,
     on_close: EventHandler<MouseEvent>,
     on_set_state: EventHandler<(String, bool, bool)>,
+    on_set_charge: EventHandler<(String, f64)>,
 ) -> Element {
     let source_label = match order.source {
         OrderSource::Shopify => "Shopify",
@@ -1166,9 +1385,39 @@ fn OrderDetailDialog(
     let archive_label = if archived { "Unarchive" } else { "Archive" };
     let key_complete = order.state_key();
     let key_archive = order.state_key();
+    let is_custom = order.source == OrderSource::Custom;
+    let order_id = order.id.clone();
+    let mut charge_input = use_signal(|| {
+        if order.total_price > 0.0 {
+            format!("{}", order.total_price)
+        } else {
+            String::new()
+        }
+    });
+
+    let order_cost: f64 = order
+        .items
+        .iter()
+        .map(|item| {
+            (item.quantity as f64)
+                * lookup_piece_cost(item, &catalog).as_ref().map(|x| x.cost_usd).unwrap_or(0.0)
+        })
+        .sum();
+    let cost_block = (order_cost > 0.0).then(|| {
+        let s = format!("$ {:.2}", order_cost);
+        let margin = order.total_price - order_cost;
+        let pct = if order.total_price > 0.0 { margin / order.total_price * 100.0 } else { 0.0 };
+        let margin_s = format!("$ {:.2} ({:.0}%)", margin, pct);
+        let margin_color = if margin < 0.0 {
+            "font-semibold text-warning-red"
+        } else {
+            "font-semibold text-alien-green"
+        };
+        (s, margin_s, margin_color)
+    });
 
     rsx! {
-        div { class: "flex items-center justify-between mb-4 flex-wrap gap-2",
+        div { class: "flex items-center justify-between mb-4 flex-wrap gap-2 flex-shrink-0",
             h2 { class: "text-xl font-bold text-star-white",
                 "{order.order_number}"
             }
@@ -1191,63 +1440,69 @@ fn OrderDetailDialog(
                 }
             }
         }
-        {match order.source {
-            OrderSource::Etsy => rsx! {
-                p { class: "text-stardust text-sm mb-3",
-                    "Receipt ID: {order.id}"
-                }
-            },
-            OrderSource::Shopify => rsx! { },
-            OrderSource::Custom => rsx! { },
-        }}
-        dl { class: "detail-grid",
-            dt { "Customer" }
-            dd { "{order.customer_name}" }
-            dt { "Order date" }
-            dd { "{order.order_date.format(\"%b %d, %Y\")}" }
-            dt { "Ship by / Due" }
-            dd { "{order.due_date.format(\"%b %d, %Y\")} ({days_display})" }
-            dt { "Status" }
-            dd { "{order.status}" }
-            dt { "Total" }
-            dd { class: "font-semibold text-star-white", "{total_str}" }
-        }
-        {{
-            let order_cost: f64 = order.items.iter()
-                .map(|item| {
-                    let cw = lookup_piece_cost(item, &catalog);
-                    (item.quantity as f64) * cw.as_ref().map(|x| x.cost_usd).unwrap_or(0.0)
-                })
-                .sum();
-            if order_cost > 0.0 {
-                let s = format!("$ {:.2}", order_cost);
-                let margin = order.total_price - order_cost;
-                let pct = if order.total_price > 0.0 { margin / order.total_price * 100.0 } else { 0.0 };
-                let margin_s = format!("$ {:.2} ({:.0}%)", margin, pct);
-                let margin_color = if margin < 0.0 { "font-semibold text-warning-red" } else { "font-semibold text-alien-green" };
-                rsx! {
+        div { class: "od-body flex-1 overflow-y-auto min-h-0",
+            {match order.source {
+                OrderSource::Etsy => rsx! {
+                    p { class: "text-stardust text-sm mb-3",
+                        "Receipt ID: {order.id}"
+                    }
+                },
+                OrderSource::Shopify => rsx! { },
+                OrderSource::Custom => rsx! { },
+            }}
+            dl { class: "detail-grid",
+                dt { "Customer" }
+                dd { "{order.customer_name}" }
+                dt { "Order date" }
+                dd { "{order.order_date.format(\"%b %d, %Y\")}" }
+                dt { "Ship by / Due" }
+                dd { "{order.due_date.format(\"%b %d, %Y\")} ({days_display})" }
+                dt { "Status" }
+                dd { "{order.status}" }
+                dt { "Total" }
+                dd { class: "font-semibold text-star-white", "{total_str}" }
+                {cost_block.as_ref().map(|(s, margin_s, margin_color)| rsx! {
                     dt { "Our cost" }
                     dd { class: "font-semibold text-aurora-purple", "{s}" }
                     dt { "Margin" }
                     dd { class: "{margin_color}", "{margin_s}" }
+                })}
+            }
+            {is_custom.then(|| rsx! {
+                div { class: "mt-4",
+                    p { class: "text-stardust text-sm font-medium mb-2", "Charge (what you're billing)" }
+                    div { class: "charge-edit",
+                        span { class: "text-stardust", "$" }
+                        input {
+                            r#type: "number", min: "0", step: "0.01", placeholder: "0.00",
+                            value: "{charge_input}",
+                            oninput: move |e| charge_input.set(e.value())
+                        }
+                        button {
+                            class: "btn-nebula", r#type: "button",
+                            onclick: move |_| {
+                                let v: f64 = charge_input.read().trim().parse().unwrap_or(0.0);
+                                on_set_charge.call((order_id.clone(), v));
+                            },
+                            "Save charge"
+                        }
+                    }
                 }
-            } else {
-                rsx! { }
-            }
-        }}
-        {order.shipping_address.as_ref().map(|addr| rsx! {
+            })}
+            {order.shipping_address.as_ref().map(|addr| rsx! {
+                div { class: "mt-4",
+                    p { class: "text-stardust text-sm font-medium mb-1", "Shipping address" }
+                    p { class: "text-moonlight text-sm", "{addr}" }
+                }
+            })}
             div { class: "mt-4",
-                p { class: "text-stardust text-sm font-medium mb-1", "Shipping address" }
-                p { class: "text-moonlight text-sm", "{addr}" }
-            }
-        })}
-        div { class: "mt-4",
-            p { class: "text-stardust text-sm font-medium mb-2", "Items" }
-            div { class: "space-y-3",
-                for item in order.items.iter() {
-                    OrderDetailItemRow {
-                        item: item.clone(),
-                        cost_weight: lookup_piece_cost(item, &catalog),
+                p { class: "text-stardust text-sm font-medium mb-2", "Items" }
+                div { class: "space-y-3",
+                    for item in order.items.iter() {
+                        OrderDetailItemRow {
+                            item: item.clone(),
+                            cost_weight: lookup_piece_cost(item, &catalog),
+                        }
                     }
                 }
             }
@@ -1288,6 +1543,82 @@ fn OrderDetailItemRow(item: OrderItem, cost_weight: Option<ItemCostWeight>) -> E
                 p { class: "text-stardust text-sm mt-1",
                     "Our cost: {cost_str} | Margin: {margin_str} | Weight: {weight_str}"
                 }
+            }
+        }
+    }
+}
+
+#[component]
+fn DraftLineRow(index: usize, line: DraftLine, lines: Signal<Vec<DraftLine>>) -> Element {
+    rsx! {
+        div { class: "draft-line",
+            div { class: "min-w-0",
+                div { class: "draft-line-name",
+                    {line.image_url.as_ref().map(|url| rsx! {
+                        img { class: "order-thumb", src: "{url}", alt: "" }
+                    })}
+                    {if line.catalog {
+                        rsx! { span { "{line.name}" } }
+                    } else {
+                        rsx! {
+                            input {
+                                r#type: "text", class: "dl-name", placeholder: "Item name",
+                                value: "{line.name}",
+                                oninput: move |e| { lines.write()[index].name = e.value(); }
+                            }
+                        }
+                    }}
+                }
+                div { class: "draft-line-fields mt-2",
+                    {if !line.sizes.is_empty() {
+                        rsx! {
+                            select {
+                                class: "dl-size",
+                                onchange: move |e| { lines.write()[index].size = e.value(); },
+                                option { value: "", "No size" }
+                                for s in line.sizes.iter() {
+                                    option { value: "{s}", selected: *s == line.size, "{s}" }
+                                }
+                            }
+                        }
+                    } else {
+                        rsx! {
+                            input {
+                                r#type: "text", class: "dl-size", placeholder: "Size",
+                                value: "{line.size}",
+                                oninput: move |e| { lines.write()[index].size = e.value(); }
+                            }
+                        }
+                    }}
+                    select {
+                        class: "dl-metal",
+                        onchange: move |e| { lines.write()[index].metal = e.value(); },
+                        option { value: "Silver", selected: line.metal == "Silver", "Silver" }
+                        option { value: "Gold Plated", selected: line.metal == "Gold Plated", "Gold Plated" }
+                        option { value: "Bronze", selected: line.metal == "Bronze", "Bronze" }
+                    }
+                    input {
+                        r#type: "number", class: "dl-qty", min: "1", placeholder: "Qty",
+                        value: "{line.qty}",
+                        oninput: move |e| {
+                            let q: u32 = e.value().trim().parse().unwrap_or(1).max(1);
+                            lines.write()[index].qty = q;
+                        }
+                    }
+                    input {
+                        r#type: "number", class: "dl-price", min: "0", step: "0.01", placeholder: "$ each",
+                        value: "{line.price}",
+                        oninput: move |e| { lines.write()[index].price = e.value(); }
+                    }
+                }
+            }
+            button {
+                class: "draft-line-remove", r#type: "button",
+                onclick: move |_| {
+                    let mut v = lines.write();
+                    if index < v.len() { v.remove(index); }
+                },
+                "\u{00d7}"
             }
         }
     }
