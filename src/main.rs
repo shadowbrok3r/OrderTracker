@@ -11,6 +11,7 @@ mod model;
 #[cfg(feature = "server")]
 mod shopify;
 
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use dioxus::prelude::*;
 use log::{app_logs_snapshot, LogEntry};
 
@@ -268,6 +269,14 @@ fn App() -> Element {
     let mut logs_open = use_signal(|| false);
     let mut log_snapshot = use_signal(|| Vec::<LogEntry>::new());
     let mut catalog = use_signal(|| Vec::<CatalogPiece>::new());
+    let mut custom_open = use_signal(|| false);
+    let mut cf_customer = use_signal(String::new);
+    let mut cf_item = use_signal(String::new);
+    let mut cf_size = use_signal(String::new);
+    let mut cf_metal = use_signal(|| "Silver".to_string());
+    let mut cf_charge = use_signal(String::new);
+    let mut cf_due = use_signal(String::new);
+    let mut cf_msg = use_signal(|| None::<String>);
 
     use_effect(move || {
         spawn(async move {
@@ -406,6 +415,11 @@ fn App() -> Element {
                             onclick: move |_| main_view.set(MainView::Catalog)
                         }
                         button {
+                            class: "btn-nebula",
+                            onclick: move |_| { custom_open.set(true); cf_msg.set(None); },
+                            "New order"
+                        }
+                        button {
                             class: "btn-cosmic",
                             onclick: move |_| {
                                 loading.set(true);
@@ -522,6 +536,122 @@ fn App() -> Element {
                 }
             } else {
                 rsx! { }
+            }}
+
+            {if *custom_open.read() {
+                rsx! {
+                    div { class: "fixed inset-0 z-50 flex items-center justify-center bg-black/60",
+                        div {
+                            class: "card-cosmic p-6 max-w-lg w-full mx-4 max-h-[90vh] overflow-y-auto",
+                            onclick: move |evt| { evt.stop_propagation(); },
+                            h2 { class: "text-xl font-bold text-star-white mb-4", "New custom order" }
+                            div { class: "space-y-3",
+                                input {
+                                    r#type: "text", class: "w-full", placeholder: "Customer name",
+                                    value: "{cf_customer}", oninput: move |e| cf_customer.set(e.value())
+                                }
+                                input {
+                                    r#type: "text", class: "w-full", placeholder: "Item / description",
+                                    value: "{cf_item}", oninput: move |e| cf_item.set(e.value())
+                                }
+                                div { class: "flex gap-2",
+                                    input {
+                                        r#type: "text", class: "w-full", placeholder: "Ring size (e.g. 9)",
+                                        value: "{cf_size}", oninput: move |e| cf_size.set(e.value())
+                                    }
+                                    select {
+                                        class: "bg-nebula-dark border border-nebula-purple rounded-lg px-3 py-2",
+                                        onchange: move |e| cf_metal.set(e.value()),
+                                        option { value: "Silver", "Silver" }
+                                        option { value: "Gold Plated", "Gold Plated" }
+                                        option { value: "Bronze", "Bronze" }
+                                    }
+                                }
+                                div { class: "flex gap-2",
+                                    input {
+                                        r#type: "number", class: "w-full", placeholder: "Charge (USD)",
+                                        value: "{cf_charge}", oninput: move |e| cf_charge.set(e.value())
+                                    }
+                                    input {
+                                        r#type: "date", class: "w-full",
+                                        value: "{cf_due}", oninput: move |e| cf_due.set(e.value())
+                                    }
+                                }
+                                {if let Some(m) = cf_msg.read().as_ref() {
+                                    rsx! { p { class: "text-warning-red text-sm", "{m}" } }
+                                } else { rsx! {} }}
+                                div { class: "flex gap-2 mt-2 justify-end",
+                                    button { class: "btn-cosmic", onclick: move |_| custom_open.set(false), "Cancel" }
+                                    button {
+                                        class: "btn-nebula",
+                                        onclick: move |_| {
+                                            let customer = cf_customer.read().trim().to_string();
+                                            let item = cf_item.read().trim().to_string();
+                                            if customer.is_empty() || item.is_empty() {
+                                                cf_msg.set(Some("Customer and item are required.".to_string()));
+                                                return;
+                                            }
+                                            let charge: f64 = cf_charge.read().trim().parse().unwrap_or(0.0);
+                                            let size = {
+                                                let s = cf_size.read().trim().to_string();
+                                                if s.is_empty() { None } else { Some(format!("{} US", s)) }
+                                            };
+                                            let metal = MetalType::from_string(&cf_metal.read());
+                                            let due = NaiveDate::parse_from_str(cf_due.read().trim(), "%Y-%m-%d")
+                                                .ok()
+                                                .and_then(|d| d.and_hms_opt(0, 0, 0))
+                                                .map(|dt| DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc))
+                                                .unwrap_or_else(|| Utc::now() + Duration::days(14));
+                                            let order = Order {
+                                                id: String::new(),
+                                                source: OrderSource::Custom,
+                                                order_number: "Custom".to_string(),
+                                                customer_name: customer,
+                                                items: vec![OrderItem {
+                                                    name: item,
+                                                    quantity: 1,
+                                                    price: charge,
+                                                    metal_type: metal,
+                                                    ring_size: size,
+                                                    variant_info: None,
+                                                    image_url: None,
+                                                }],
+                                                order_date: Utc::now(),
+                                                due_date: due,
+                                                total_price: charge,
+                                                currency: "USD".to_string(),
+                                                status: "open".to_string(),
+                                                shipping_address: None,
+                                                archived: false,
+                                                completed: false,
+                                            };
+                                            spawn(async move {
+                                                match api::create_custom_order(order).await {
+                                                    Ok(()) => {
+                                                        custom_open.set(false);
+                                                        cf_customer.set(String::new());
+                                                        cf_item.set(String::new());
+                                                        cf_size.set(String::new());
+                                                        cf_charge.set(String::new());
+                                                        cf_due.set(String::new());
+                                                        cf_msg.set(None);
+                                                        if let Ok(result) = api::fetch_all_orders().await {
+                                                            orders.set(result.orders);
+                                                        }
+                                                    }
+                                                    Err(e) => cf_msg.set(Some(e.to_string())),
+                                                }
+                                            });
+                                        },
+                                        "Create order"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                rsx! {}
             }}
 
             DialogRoot {
