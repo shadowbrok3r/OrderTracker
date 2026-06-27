@@ -62,7 +62,7 @@ fn server_main() {
         self,
         body::{to_bytes, Body},
         extract::Request,
-        http::{header::{CONTENT_LENGTH, CONTENT_TYPE}, Uri},
+        http::{header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE}, Uri},
         middleware::{self, Next},
         response::Response,
         Router,
@@ -85,6 +85,8 @@ fn server_main() {
     // router (static assets + server fns) matches normally. No-op when HA already
     // stripped it or there is no ingress header (direct access).
     async fn strip_ingress_prefix(mut req: Request, next: Next) -> Response {
+        // Force uncompressed responses so the asset-URL rewrite can edit bodies.
+        req.headers_mut().remove(ACCEPT_ENCODING);
         if let Some(prefix) = req
             .headers()
             .get("x-ingress-path")
@@ -118,20 +120,26 @@ fn server_main() {
             .map(|s| s.trim_end_matches('/').to_string())
             .filter(|s| !s.is_empty());
 
+        let path = req.uri().path().to_string();
         let res = next.run(req).await;
 
         let Some(ingress) = ingress else {
             return res;
         };
+        // Skip compressed bodies (Accept-Encoding is stripped upstream, but be safe).
+        if res.headers().contains_key(CONTENT_ENCODING) {
+            return res;
+        }
         let ctype = res
             .headers()
             .get(CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let is_html = ctype.starts_with("text/html");
-        let is_js = ctype.contains("javascript");
-        let is_css = ctype.starts_with("text/css");
+        // Detect by request path extension (content-type from ServeFile is unreliable).
+        let is_js = path.ends_with(".js");
+        let is_css = path.ends_with(".css");
+        let is_html = !is_js && !is_css && ctype.starts_with("text/html");
         if !(is_html || is_js || is_css) {
             return res;
         }
@@ -147,15 +155,14 @@ fn server_main() {
                 .replace("=\"/./assets/", &format!("=\"{ingress}/assets/"))
                 .replace("=\"/assets/", &format!("=\"{ingress}/assets/"))
                 .replace("=\"/api/", &format!("=\"{ingress}/api/"))
-        } else if is_js {
+        } else {
+            // JS and CSS: prefix every absolute asset path (incl. the wasm loader's).
             text.replace("/./assets/", &format!("{ingress}/assets/"))
                 .replace("\"/assets/", &format!("\"{ingress}/assets/"))
                 .replace("'/assets/", &format!("'{ingress}/assets/"))
-        } else {
-            text.replace("url(/assets/", &format!("url({ingress}/assets/"))
-                .replace("url(\"/assets/", &format!("url(\"{ingress}/assets/"))
-                .replace("url('/assets/", &format!("url('{ingress}/assets/"))
+                .replace("(/assets/", &format!("({ingress}/assets/"))
         };
+        tracing::debug!(path = %path, ctype = %ctype, "rewrote ingress asset urls");
 
         parts.headers.remove(CONTENT_LENGTH);
         Response::from_parts(parts, Body::from(rewritten))
