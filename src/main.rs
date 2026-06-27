@@ -370,8 +370,8 @@ fn App() -> Element {
                                 loading.set(true);
                                 error.set(None);
                                 spawn(async move {
-                                    log::app_log("INFO", "Refresh: fetching orders...");
-                                    match api::fetch_all_orders().await {
+                                    log::app_log("INFO", "Refresh: pulling live from Shopify + Etsy...");
+                                    match api::refresh_orders().await {
                                         Ok(result) => {
                                             let total = result.orders.len();
                                             log::app_log("INFO", format!("Refresh done. {} total orders.", total));

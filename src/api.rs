@@ -13,10 +13,10 @@ pub struct FetchOrdersResult {
     pub errors: Vec<String>,
 }
 
-/// Fetch orders from Shopify and Etsy. Errors from individual sources are
-/// collected in `errors` so partial results are still returned.
-#[server]
-pub async fn fetch_all_orders() -> Result<FetchOrdersResult, ServerFnError> {
+/// Fetch live from Shopify + Etsy (errors collected per source) and replace the
+/// SurrealDB order cache.
+#[cfg(feature = "server")]
+async fn live_fetch_and_cache() -> FetchOrdersResult {
     let mut all_orders = Vec::new();
     let mut errors = Vec::new();
 
@@ -24,17 +24,42 @@ pub async fn fetch_all_orders() -> Result<FetchOrdersResult, ServerFnError> {
         Ok(shopify_orders) => all_orders.extend(shopify_orders),
         Err(e) => errors.push(format!("Shopify: {}", e)),
     }
-
     match crate::etsy::fetch_etsy_orders().await {
         Ok(etsy_orders) => all_orders.extend(etsy_orders),
         Err(e) => errors.push(format!("Etsy: {}", e)),
     }
-
     all_orders.sort_by(|a, b| a.due_date.cmp(&b.due_date));
-    Ok(FetchOrdersResult {
-        orders: all_orders,
-        errors,
-    })
+
+    if !all_orders.is_empty() && crate::db::ensure_db_init().await.is_ok() {
+        if let Err(e) = crate::db::save_orders(&all_orders).await {
+            crate::log::app_log("INFO", format!("Order cache write failed: {}", e));
+        }
+    }
+    FetchOrdersResult { orders: all_orders, errors }
+}
+
+/// Return cached orders if fresh (< 1 day), otherwise fetch live and cache.
+#[server]
+pub async fn fetch_all_orders() -> Result<FetchOrdersResult, ServerFnError> {
+    if crate::db::ensure_db_init().await.is_ok() {
+        if let Ok(payloads) = crate::db::load_cached_orders().await {
+            if !payloads.is_empty() {
+                let orders: Vec<Order> =
+                    payloads.iter().filter_map(|p| serde_json::from_str(p).ok()).collect();
+                if !orders.is_empty() {
+                    crate::log::app_log("INFO", format!("Served {} orders from cache.", orders.len()));
+                    return Ok(FetchOrdersResult { orders, errors: Vec::new() });
+                }
+            }
+        }
+    }
+    Ok(live_fetch_and_cache().await)
+}
+
+/// Force a live Shopify + Etsy fetch and refresh the cache (manual Refresh).
+#[server]
+pub async fn refresh_orders() -> Result<FetchOrdersResult, ServerFnError> {
+    Ok(live_fetch_and_cache().await)
 }
 
 /// Load the jewelry catalog (pieces + linked sizes) from SurrealDB.

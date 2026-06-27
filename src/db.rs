@@ -5,6 +5,7 @@ use std::sync::LazyLock;
 use surrealdb::engine::remote::ws::{Client, Ws, Wss};
 use surrealdb::opt::auth::Root;
 use surrealdb::Surreal;
+use surrealdb_types::SurrealValue;
 
 const NS: &str = "jewelry_calculator";
 const DB_NAME: &str = "jewelry_calculator";
@@ -51,6 +52,44 @@ pub async fn ensure_db_init() -> Result<(), String> {
         })
         .await
         .map(|_| ())
+}
+
+#[derive(SurrealValue)]
+struct OrderCacheRow {
+    source: String,
+    order_number: String,
+    payload: String,
+}
+
+/// JSON payloads of orders cached within the last day (empty = stale/miss).
+pub async fn load_cached_orders() -> Result<Vec<String>, String> {
+    let mut res = DB
+        .query("SELECT VALUE payload FROM orders WHERE fetched_at > time::now() - 1d")
+        .await
+        .map_err(|e| e.to_string())?;
+    res.take(0).map_err(|e| e.to_string())
+}
+
+/// Replace the order cache with the given set (fetched_at set to now).
+pub async fn save_orders(orders: &[crate::model::Order]) -> Result<(), String> {
+    let rows: Vec<OrderCacheRow> = orders
+        .iter()
+        .map(|o| OrderCacheRow {
+            source: match o.source {
+                crate::model::OrderSource::Shopify => "shopify".to_string(),
+                crate::model::OrderSource::Etsy => "etsy".to_string(),
+            },
+            order_number: o.order_number.clone(),
+            payload: serde_json::to_string(o).unwrap_or_default(),
+        })
+        .collect();
+    DB.query("DELETE orders; INSERT INTO orders $rows")
+        .bind(("rows", rows))
+        .await
+        .map_err(|e| e.to_string())?
+        .check()
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Load the catalog: every jewelry piece with its linked piece_costs sizes.
