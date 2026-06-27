@@ -46,6 +46,21 @@ enum SortBy {
     Customer,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CatalogKind {
+    All,
+    Ring,
+    Pendant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CatalogSort {
+    Name,
+    CostAsc,
+    CostDesc,
+    SizesDesc,
+}
+
 /// A pickable product in the New Order builder: a catalog piece or a name reused
 /// from a past custom order.
 #[derive(Clone, PartialEq)]
@@ -1076,6 +1091,14 @@ fn find_thumb(orders: &[Order], name: &str, size: &Option<String>) -> Option<Str
     fallback
 }
 
+/// Cheapest silver cost across a piece's sizes (representative for sorting).
+fn piece_min_silver(p: &CatalogPiece) -> Option<f64> {
+    p.sizes
+        .iter()
+        .filter_map(|s| s.silver_usd)
+        .fold(None, |acc, v| Some(acc.map_or(v, |a: f64| a.min(v))))
+}
+
 /// Catalog sizes are stored already-formatted ("US 9"); custom free-text sizes
 /// are normalized to "{n} US" when numeric, else kept verbatim.
 fn normalize_size(raw: &str, catalog: bool) -> Option<String> {
@@ -1091,25 +1114,154 @@ fn normalize_size(raw: &str, catalog: bool) -> Option<String> {
 
 #[component]
 fn CatalogView(catalog: Vec<CatalogPiece>) -> Element {
+    let mut search = use_signal(String::new);
+    let mut kind_filter = use_signal(|| CatalogKind::All);
+    let mut sort_by = use_signal(|| CatalogSort::Name);
+    let mut grouped = use_signal(|| true);
+
     let total_pieces = catalog.len();
-    let total_rows: usize = catalog.iter().map(|p| p.sizes.len()).sum();
-    let mut sorted = catalog.clone();
-    sorted.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+
+    let filtered: Vec<CatalogPiece> = {
+        let q = search.read().to_lowercase();
+        let kf = *kind_filter.read();
+        let mut list: Vec<CatalogPiece> = catalog
+            .iter()
+            .filter(|p| q.is_empty() || p.name.to_lowercase().contains(&q))
+            .filter(|p| match kf {
+                CatalogKind::All => true,
+                CatalogKind::Ring => p.kind.eq_ignore_ascii_case("ring"),
+                CatalogKind::Pendant => p.kind.eq_ignore_ascii_case("pendant"),
+            })
+            .cloned()
+            .collect();
+        match *sort_by.read() {
+            CatalogSort::Name => {
+                list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            }
+            CatalogSort::CostAsc => list.sort_by(|a, b| {
+                piece_min_silver(a)
+                    .unwrap_or(f64::INFINITY)
+                    .partial_cmp(&piece_min_silver(b).unwrap_or(f64::INFINITY))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+            CatalogSort::CostDesc => list.sort_by(|a, b| {
+                piece_min_silver(b)
+                    .unwrap_or(f64::NEG_INFINITY)
+                    .partial_cmp(&piece_min_silver(a).unwrap_or(f64::NEG_INFINITY))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+            CatalogSort::SizesDesc => list.sort_by(|a, b| b.sizes.len().cmp(&a.sizes.len())),
+        }
+        list
+    };
+    let shown = filtered.len();
+    let total_rows: usize = filtered.iter().map(|p| p.sizes.len()).sum();
+
+    let is_grouped = *grouped.read();
+    let groups: Vec<(String, Vec<CatalogPiece>)> = if is_grouped {
+        let pick = |k: &str| -> Vec<CatalogPiece> {
+            filtered.iter().filter(|p| p.kind.eq_ignore_ascii_case(k)).cloned().collect()
+        };
+        let rings = pick("ring");
+        let pendants = pick("pendant");
+        let other: Vec<CatalogPiece> = filtered
+            .iter()
+            .filter(|p| !p.kind.eq_ignore_ascii_case("ring") && !p.kind.eq_ignore_ascii_case("pendant"))
+            .cloned()
+            .collect();
+        let mut g = Vec::new();
+        if !rings.is_empty() {
+            g.push(("Rings".to_string(), rings));
+        }
+        if !pendants.is_empty() {
+            g.push(("Pendants".to_string(), pendants));
+        }
+        if !other.is_empty() {
+            g.push(("Other".to_string(), other));
+        }
+        g
+    } else {
+        vec![(String::new(), filtered.clone())]
+    };
+
     rsx! {
         div { class: "card-cosmic p-6 mb-6",
-            div { class: "flex items-center justify-between flex-wrap gap-3",
+            div { class: "flex items-center justify-between flex-wrap gap-3 mb-4",
                 h2 { class: "text-xl font-bold text-star-white", "Catalog" }
-                span { class: "text-stardust text-sm", "{total_pieces} pieces \u{00b7} {total_rows} cost rows" }
+                span { class: "text-stardust text-sm", "{shown} of {total_pieces} pieces \u{00b7} {total_rows} cost rows" }
+            }
+            div { class: "flex flex-wrap items-center gap-4",
+                div { class: "flex-1 min-w-0",
+                    input {
+                        r#type: "search", class: "w-full",
+                        placeholder: "Search catalog...",
+                        value: "{search}",
+                        oninput: move |e| search.set(e.value())
+                    }
+                }
+                div { class: "flex gap-2",
+                    FilterButton {
+                        label: "All",
+                        active: *kind_filter.read() == CatalogKind::All,
+                        onclick: move |_| kind_filter.set(CatalogKind::All)
+                    }
+                    FilterButton {
+                        label: "Rings",
+                        active: *kind_filter.read() == CatalogKind::Ring,
+                        onclick: move |_| kind_filter.set(CatalogKind::Ring)
+                    }
+                    FilterButton {
+                        label: "Pendants",
+                        active: *kind_filter.read() == CatalogKind::Pendant,
+                        onclick: move |_| kind_filter.set(CatalogKind::Pendant)
+                    }
+                }
+                div { class: "flex items-center gap-2",
+                    span { class: "text-stardust text-sm", "Sort:" }
+                    select {
+                        class: "bg-nebula-dark border border-nebula-purple rounded-lg px-3 py-2",
+                        onchange: move |e| {
+                            match e.value().as_str() {
+                                "name" => sort_by.set(CatalogSort::Name),
+                                "cost_asc" => sort_by.set(CatalogSort::CostAsc),
+                                "cost_desc" => sort_by.set(CatalogSort::CostDesc),
+                                "sizes" => sort_by.set(CatalogSort::SizesDesc),
+                                _ => {}
+                            }
+                        },
+                        option { value: "name", "Name (A\u{2013}Z)" }
+                        option { value: "cost_asc", "Silver $ (low\u{2013}high)" }
+                        option { value: "cost_desc", "Silver $ (high\u{2013}low)" }
+                        option { value: "sizes", "Most sizes" }
+                    }
+                }
+                FilterButton {
+                    label: "Grouped",
+                    active: is_grouped,
+                    onclick: move |_| { let g = *grouped.read(); grouped.set(!g); }
+                }
             }
         }
         if catalog.is_empty() {
             div { class: "card-cosmic p-8 text-center",
                 p { class: "text-stardust", "Catalog is empty. Publish from the cost calculator." }
             }
+        } else if shown == 0 {
+            div { class: "card-cosmic p-8 text-center",
+                p { class: "text-stardust", "No catalog pieces match your filters." }
+            }
         } else {
-            div { class: "card-cosmic overflow-hidden",
-                for piece in sorted.iter() {
-                    CatalogPieceCard { piece: piece.clone() }
+            for (label, pieces) in groups.iter() {
+                div { class: "card-cosmic overflow-hidden mb-6",
+                    {(!label.is_empty()).then(|| rsx! {
+                        div { class: "catalog-group-title",
+                            h3 { class: "text-star-white font-semibold", "{label}" }
+                            span { class: "text-stardust text-sm", "{pieces.len()} pieces" }
+                        }
+                    })}
+                    for piece in pieces.iter() {
+                        CatalogPieceCard { piece: piece.clone() }
+                    }
                 }
             }
         }
