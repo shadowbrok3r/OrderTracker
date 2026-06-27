@@ -16,7 +16,8 @@ else
 fi
 
 bashio::log.info "Starting Order Tracker on 0.0.0.0:8099..."
-# dioxus::launch binds from the IP/PORT env vars; it ignores CLI --addr/--port.
+# Server binds from IP/PORT (dioxus cli-config); RUST_LOG drives request logging.
 export IP="0.0.0.0"
 export PORT="8099"
+export RUST_LOG="info,tower_http=debug,order_tracker=debug"
 exec /app/order_tracker

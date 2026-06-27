@@ -19,10 +19,13 @@ surrealdb-types = { version = "3.1.4", optional = true }
 openssl = { version = "0.10", features = ["vendored"], optional = true }
 directories = { version = "6.0.0", optional = true }
 dotenvy = { version = "0.15.7", optional = true }
+tower-http = { version = "0.6", features = ["trace"], optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
 
 [features]
 default = []
-server = ["dioxus/server", "dep:tokio", "dep:reqwest", "dep:surrealdb", "dep:surrealdb-types", "dep:openssl", "dep:directories", "dep:dotenvy", "jewelry_shared/surreal"]
+server = ["dioxus/server", "dep:tokio", "dep:reqwest", "dep:surrealdb", "dep:surrealdb-types", "dep:openssl", "dep:directories", "dep:dotenvy", "jewelry_shared/surreal", "dep:tower-http", "dep:tracing", "dep:tracing-subscriber"]
 web = ["dioxus/web"]
 desktop = ["dioxus/desktop"]
 

@@ -43,16 +43,109 @@ enum SortBy {
 fn main() {
     #[cfg(feature = "server")]
     {
-        dotenvy::dotenv().ok();
+        server_main();
+        return;
     }
-    #[cfg(target_arch = "wasm32")]
+
+    #[cfg(all(not(feature = "server"), target_arch = "wasm32"))]
     init_ha_ingress_server_url_for_fullstack();
+
+    #[cfg(not(feature = "server"))]
     dioxus::launch(App);
 }
 
-/// Home Assistant Ingress serves this UI at `https://<host>/app/<slug>/…`.
-/// Dioxus server functions default to `/api/…` on the host root, which misses Ingress and
-/// breaks behind HA (502 / empty UI). Point the client at `origin + /app/<slug>` instead.
+// Server entry: own tokio runtime, RUST_LOG tracing subscriber, per-request
+// TraceLayer logging, X-Ingress-Path SSR rewrite, and IP/PORT bind.
+#[cfg(feature = "server")]
+fn server_main() {
+    use dioxus::server::axum::{
+        self,
+        body::{to_bytes, Body},
+        extract::Request,
+        http::header::{CONTENT_LENGTH, CONTENT_TYPE},
+        middleware::{self, Next},
+        response::Response,
+        Router,
+    };
+    use dioxus::server::{DioxusRouterExt, ServeConfig};
+    use tower_http::trace::TraceLayer;
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+    dotenvy::dotenv().ok();
+
+    tracing_subscriber::registry()
+        .with(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,tower_http=debug")),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
+    // Prefix absolute asset/api URLs in SSR HTML with the per-session HA ingress path.
+    async fn rewrite_ingress_assets(req: Request, next: Next) -> Response {
+        let ingress = req
+            .headers()
+            .get("x-ingress-path")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty());
+
+        let res = next.run(req).await;
+
+        let Some(ingress) = ingress else {
+            return res;
+        };
+        let is_html = res
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|c| c.starts_with("text/html"))
+            .unwrap_or(false);
+        if !is_html {
+            return res;
+        }
+
+        let (mut parts, body) = res.into_parts();
+        let bytes = match to_bytes(body, usize::MAX).await {
+            Ok(b) => b,
+            Err(_) => return Response::from_parts(parts, Body::empty()),
+        };
+        let html = String::from_utf8_lossy(&bytes);
+        let rewritten = html
+            .replacen("<head>", &format!("<head><base href=\"{ingress}/\">"), 1)
+            .replace("=\"/./assets/", &format!("=\"{ingress}/assets/"))
+            .replace("=\"/assets/", &format!("=\"{ingress}/assets/"))
+            .replace("=\"/api/", &format!("=\"{ingress}/api/"));
+
+        parts.headers.remove(CONTENT_LENGTH);
+        Response::from_parts(parts, Body::from(rewritten))
+    }
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime")
+        .block_on(async {
+            // Honors IP/PORT env (the run script sets 0.0.0.0:8099).
+            let addr = dioxus::cli_config::fullstack_address_or_localhost();
+
+            let app: Router = Router::new()
+                .serve_dioxus_application(ServeConfig::new(), App)
+                .layer(middleware::from_fn(rewrite_ingress_assets))
+                .layer(TraceLayer::new_for_http());
+
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
+            tracing::info!(%addr, "OrderTracker server listening");
+
+            axum::serve(listener, app).await.expect("axum server error");
+        });
+}
+
+/// Home Assistant serves the add-on UI under a per-session ingress path
+/// (`/api/hassio_ingress/<token>/`). Point dioxus server-function calls there so the
+/// client's POSTs route back through ingress instead of hitting the host root.
 #[cfg(target_arch = "wasm32")]
 fn init_ha_ingress_server_url_for_fullstack() {
     use dioxus::fullstack::set_server_url;
@@ -67,18 +160,13 @@ fn init_ha_ingress_server_url_for_fullstack() {
         return;
     };
 
-    let segments: Vec<&str> = pathname
-        .trim_end_matches('/')
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .collect();
-    if segments.len() < 2 || segments[0] != "app" {
-        return;
+    let segments: Vec<&str> = pathname.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.len() >= 3 && segments[0] == "api" && segments[1] == "hassio_ingress" {
+        let token = segments[2];
+        let base = format!("{origin}/api/hassio_ingress/{token}");
+        let leaked: &'static str = Box::leak(base.into_boxed_str());
+        set_server_url(leaked);
     }
-    let slug = segments[1];
-    let base = format!("{origin}/app/{slug}");
-    let leaked: &'static str = Box::leak(base.into_boxed_str());
-    set_server_url(leaked);
 }
 
 #[component]
