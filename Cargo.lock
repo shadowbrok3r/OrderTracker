@@ -5081,6 +5081,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 name = "order_tracker"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "chrono",
  "dioxus",
  "dioxus-primitives",
@@ -6239,10 +6240,12 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-rustls",
+ "hyper-tls",
  "hyper-util",
  "js-sys",
  "log",
  "mime_guess",
+ "native-tls",
  "percent-encoding",
  "pin-project-lite",
  "quinn",
@@ -6253,6 +6256,7 @@ dependencies = [
  "serde_json",
  "sync_wrapper",
  "tokio",
+ "tokio-native-tls",
  "tokio-rustls",
  "tokio-util",
  "tower",
@@ -7229,6 +7233,7 @@ dependencies = [
  "getrandom 0.3.4",
  "indexmap",
  "js-sys",
+ "native-tls",
  "path-clean",
  "reqwest 0.13.4",
  "ring",
@@ -7797,9 +7802,11 @@ checksum = "d25a406cddcc431a75d3d9afc6a7c0f7428d4891dd973e4d54c56b46127bf857"
 dependencies = [
  "futures-util",
  "log",
+ "native-tls",
  "rustls",
  "rustls-pki-types",
  "tokio",
+ "tokio-native-tls",
  "tokio-rustls",
  "tungstenite 0.28.0",
  "webpki-roots 0.26.11",
