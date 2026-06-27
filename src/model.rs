@@ -175,7 +175,8 @@ fn pick_cost_weight(row: &PieceCostRow, metal: &MetalType) -> Option<ItemCostWei
             row.silver_usd.unwrap_or(0.0),
             row.silver_g.unwrap_or(0.0),
         ),
-        MetalType::Gold => (row.gold_usd.unwrap_or(0.0), row.gold_g.unwrap_or(0.0)),
+        // "Gold Plated" pieces are cast in silver then plated, so cost from the silver base.
+        MetalType::Gold => (row.silver_usd.unwrap_or(0.0), row.silver_g.unwrap_or(0.0)),
         MetalType::Bronze => (
             row.bronze_usd.unwrap_or(0.0),
             row.bronze_g.unwrap_or(0.0),
