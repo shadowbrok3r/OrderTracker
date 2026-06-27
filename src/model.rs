@@ -149,9 +149,23 @@ pub fn lookup_piece_cost(item: &OrderItem, piece_costs: &[PieceCostRow]) -> Opti
 fn ring_matches(row_ring: &Option<String>, item_ring: &Option<String>) -> bool {
     match (row_ring, item_ring) {
         (None, _) => true,
-        (Some(s), _) if s.is_empty() || s == "N/A" => true,
-        (Some(rs), Some(is)) => rs.trim() == is.trim(),
+        (Some(s), _) if is_wildcard_size(s) => true,
+        (Some(rs), Some(is)) => ring_size_key(rs) == ring_size_key(is),
         (Some(_), None) => false,
+    }
+}
+
+fn is_wildcard_size(s: &str) -> bool {
+    let t = s.trim();
+    t.is_empty() || t.eq_ignore_ascii_case("N/A")
+}
+
+// Numeric core of a ring size so "US 9" matches "9" and "US 8.75" matches "8.75".
+fn ring_size_key(s: &str) -> String {
+    let digits: String = s.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect();
+    match digits.trim_matches('.').parse::<f64>() {
+        Ok(v) => format!("{}", (v * 100.0).round() / 100.0),
+        Err(_) => s.trim().to_lowercase(),
     }
 }
 
