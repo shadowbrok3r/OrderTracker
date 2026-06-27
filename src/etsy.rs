@@ -10,9 +10,6 @@ use crate::model::{MetalType, Order, OrderItem, OrderSource};
 fn etsy_keystring() -> String {
     std::env::var("ETSY_KEYSTRING").unwrap_or_default()
 }
-fn etsy_secret() -> String {
-    std::env::var("ETSY_SECRET").unwrap_or_default()
-}
 fn etsy_shop_id() -> String {
     std::env::var("ETSY_SHOP_ID").unwrap_or_default()
 }
@@ -73,11 +70,7 @@ async fn get_etsy_access_token() -> Result<String, String> {
         let refresh = refresh.clone();
         return refresh_etsy_token_async(&mut cfg, &refresh).await;
     }
-    let secret = etsy_secret();
-    if !secret.is_empty() {
-        return Ok(secret);
-    }
-    Err("Etsy not connected. Get a refresh token from order-tracker.kingsofalchemy.com/connect and paste it in Settings.".to_string())
+    Err("Etsy not connected. Open Settings \u{2192} Connect Etsy and paste a refresh token.".to_string())
 }
 
 async fn refresh_etsy_token_async(cfg: &mut EtsyOAuthConfig, refresh_token: &str) -> Result<String, String> {
@@ -235,7 +228,7 @@ pub async fn fetch_etsy_orders() -> Result<Vec<Order>, String> {
         "https://api.etsy.com/v3/application/shops/{}/receipts",
         etsy_shop_id()
     );
-    let x_api_key = format!("{}:{}", etsy_keystring(), etsy_secret());
+    let x_api_key = etsy_keystring();
 
     let mut all_receipts = Vec::new();
     let mut offset = 0i32;

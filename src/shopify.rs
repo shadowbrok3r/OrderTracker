@@ -48,6 +48,23 @@ struct ShopifyLineItem {
     price: String,
     variant_title: Option<String>,
     properties: Option<Vec<ShopifyProperty>>,
+    #[serde(default)]
+    product_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShopifyProductResponse {
+    product: ShopifyProduct,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShopifyProduct {
+    image: Option<ShopifyImage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShopifyImage {
+    src: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,6 +113,35 @@ fn extract_ring_size(name: &str, properties: &Option<Vec<ShopifyProperty>>) -> O
     None
 }
 
+/// Fetch the primary image URL for each product id.
+async fn fetch_product_image_urls(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    ids: &[i64],
+) -> std::collections::HashMap<i64, String> {
+    let mut out = std::collections::HashMap::new();
+    for &id in ids {
+        let url = format!("{}/products/{}.json?fields=id,image", base_url, id);
+        let resp = client
+            .get(&url)
+            .header("X-Shopify-Access-Token", token)
+            .send()
+            .await;
+        if let Ok(r) = resp {
+            if r.status().is_success() {
+                if let Ok(p) = r.json::<ShopifyProductResponse>().await {
+                    let src = p.product.image.and_then(|i| i.src).filter(|s| !s.is_empty());
+                    if let Some(src) = src {
+                        out.insert(id, src);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -131,6 +177,17 @@ pub async fn fetch_shopify_orders() -> Result<Vec<Order>, String> {
 
     log::app_log("INFO", format!("Shopify: got {} orders, mapping...", shopify_response.orders.len()));
 
+    let mut product_ids: Vec<i64> = shopify_response
+        .orders
+        .iter()
+        .flat_map(|o| o.line_items.iter().filter_map(|li| li.product_id))
+        .collect();
+    product_ids.sort_unstable();
+    product_ids.dedup();
+    log::app_log("INFO", format!("Shopify: fetching images for {} products...", product_ids.len()));
+    let image_urls =
+        fetch_product_image_urls(&client, &shopify_url(), &shopify_access_token(), &product_ids).await;
+
     let orders = shopify_response
         .orders
         .into_iter()
@@ -163,6 +220,7 @@ pub async fn fetch_shopify_orders() -> Result<Vec<Order>, String> {
                     );
                     let metal_type = MetalType::from_string(&full_name);
                     let ring_size = extract_ring_size(&full_name, &li.properties);
+                    let image_url = li.product_id.and_then(|id| image_urls.get(&id).cloned());
                     OrderItem {
                         name: li.name,
                         quantity: li.quantity as u32,
@@ -170,7 +228,7 @@ pub async fn fetch_shopify_orders() -> Result<Vec<Order>, String> {
                         metal_type,
                         ring_size,
                         variant_info: li.variant_title,
-                        image_url: None,
+                        image_url,
                     }
                 })
                 .collect();
