@@ -67,10 +67,11 @@ fn server_main() {
     use dioxus::server::axum::{
         self,
         body::{to_bytes, Body},
-        extract::Request,
-        http::{header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE}, Uri},
+        extract::{Path, Request},
+        http::{header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE}, StatusCode, Uri},
         middleware::{self, Next},
         response::Response,
+        routing::get,
         Router, ServiceExt,
     };
     use dioxus::server::{DioxusRouterExt, ServeConfig};
@@ -178,6 +179,24 @@ fn server_main() {
         Response::from_parts(parts, Body::from(rewritten))
     }
 
+    // Stream a cached thumbnail from the SurrealDB bucket.
+    async fn thumb_handler(Path(key): Path<String>) -> Response {
+        match crate::db::get_thumbnail(&key).await {
+            Some((bytes, ctype)) => {
+                let mut resp = Response::new(Body::from(bytes));
+                if let Ok(v) = ctype.parse() {
+                    resp.headers_mut().insert(CONTENT_TYPE, v);
+                }
+                resp
+            }
+            None => {
+                let mut resp = Response::new(Body::empty());
+                *resp.status_mut() = StatusCode::NOT_FOUND;
+                resp
+            }
+        }
+    }
+
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -188,6 +207,7 @@ fn server_main() {
 
             let app: Router = Router::new()
                 .serve_dioxus_application(ServeConfig::new(), App)
+                .route("/thumb/{key}", get(thumb_handler))
                 .layer(middleware::from_fn(rewrite_ingress_assets))
                 .layer(TraceLayer::new_for_http());
 

@@ -92,6 +92,99 @@ pub async fn save_orders(orders: &[crate::model::Order]) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Thumbnail bucket (cached Shopify/Etsy product images)
+// ---------------------------------------------------------------------------
+
+const THUMB_BUCKET: &str = "thumbnails";
+
+fn thumb_content_type(key: &str) -> &'static str {
+    if key.ends_with(".png") {
+        "image/png"
+    } else if key.ends_with(".webp") {
+        "image/webp"
+    } else if key.ends_with(".gif") {
+        "image/gif"
+    } else {
+        "image/jpeg"
+    }
+}
+
+/// Keys are our own `<hash>.<ext>` slugs; reject anything else (the key is
+/// interpolated into the file literal).
+fn safe_key(key: &str) -> bool {
+    !key.is_empty() && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.')
+}
+
+async fn thumb_exists(key: &str) -> bool {
+    let q = format!("RETURN file::exists(f\"{THUMB_BUCKET}:/{key}\")");
+    if let Ok(mut res) = DB.query(q).await {
+        if let Ok(Some(b)) = res.take::<Option<bool>>(0) {
+            return b;
+        }
+    }
+    false
+}
+
+/// Store image bytes in the thumbnails bucket (base64 in, decoded server-side).
+pub async fn put_thumbnail(key: &str, bytes: &[u8]) -> Result<(), String> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    if !safe_key(key) {
+        return Err("invalid thumbnail key".into());
+    }
+    let b64 = STANDARD.encode(bytes);
+    let q = format!("f\"{THUMB_BUCKET}:/{key}\".put(encoding::base64::decode($b64))");
+    DB.query(q).bind(("b64", b64)).await.map_err(|e| e.to_string())?.check().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Fetch a thumbnail's bytes + content-type from the bucket.
+pub async fn get_thumbnail(key: &str) -> Option<(Vec<u8>, String)> {
+    use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine};
+    if !safe_key(key) {
+        return None;
+    }
+    ensure_db_init().await.ok()?;
+    let q = format!("RETURN encoding::base64::encode(f\"{THUMB_BUCKET}:/{key}\".get())");
+    let mut res = DB.query(q).await.ok()?;
+    let b64: Option<String> = res.take(0).ok()?;
+    let bytes = STANDARD_NO_PAD.decode(b64?.trim_end_matches('=')).ok()?;
+    Some((bytes, thumb_content_type(key).to_string()))
+}
+
+/// Download an image once, cache it in the bucket, and return the app-relative
+/// `thumb/<key>` URL OrderTracker serves it under.
+pub async fn cache_thumbnail(client: &reqwest::Client, url: &str) -> Option<String> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    url.hash(&mut h);
+    let resp = client.get(url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let ct = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let ext = if ct.contains("png") {
+        "png"
+    } else if ct.contains("webp") {
+        "webp"
+    } else if ct.contains("gif") {
+        "gif"
+    } else {
+        "jpg"
+    };
+    let key = format!("{:016x}.{}", h.finish(), ext);
+    if !thumb_exists(&key).await {
+        let bytes = resp.bytes().await.ok()?;
+        put_thumbnail(&key, &bytes).await.ok()?;
+    }
+    Some(format!("thumb/{}", key))
+}
+
 /// Load the catalog: every jewelry piece with its linked piece_costs sizes.
 pub async fn load_catalog() -> Result<Vec<crate::model::CatalogPiece>, String> {
     let q = "SELECT name, kind, product_keys, \

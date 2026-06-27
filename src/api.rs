@@ -31,11 +31,30 @@ async fn live_fetch_and_cache() -> FetchOrdersResult {
     all_orders.sort_by(|a, b| a.due_date.cmp(&b.due_date));
 
     if !all_orders.is_empty() && crate::db::ensure_db_init().await.is_ok() {
+        cache_thumbnails(&mut all_orders).await;
         if let Err(e) = crate::db::save_orders(&all_orders).await {
             crate::log::app_log("INFO", format!("Order cache write failed: {}", e));
         }
     }
     FetchOrdersResult { orders: all_orders, errors }
+}
+
+/// Download each order item's source image into the SurrealDB thumbnails bucket
+/// and rewrite image_url to the app-served `thumb/<key>` path.
+#[cfg(feature = "server")]
+async fn cache_thumbnails(orders: &mut [Order]) {
+    let client = reqwest::Client::new();
+    for order in orders.iter_mut() {
+        for item in order.items.iter_mut() {
+            if let Some(url) = item.image_url.clone() {
+                if url.starts_with("http") {
+                    if let Some(cached) = crate::db::cache_thumbnail(&client, &url).await {
+                        item.image_url = Some(cached);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Return cached orders if fresh (< 1 day), otherwise fetch live and cache.

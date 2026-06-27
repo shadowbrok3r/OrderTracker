@@ -23,10 +23,11 @@ tower = { version = "0.5", optional = true }
 tower-http = { version = "0.6", features = ["trace"], optional = true }
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
+base64 = { version = "0.22", optional = true }
 
 [features]
 default = []
-server = ["dioxus/server", "dep:tokio", "dep:reqwest", "dep:surrealdb", "dep:surrealdb-types", "dep:openssl", "dep:directories", "dep:dotenvy", "jewelry_shared/surreal", "dep:tower", "dep:tower-http", "dep:tracing", "dep:tracing-subscriber"]
+server = ["dioxus/server", "dep:tokio", "dep:reqwest", "dep:surrealdb", "dep:surrealdb-types", "dep:openssl", "dep:directories", "dep:dotenvy", "jewelry_shared/surreal", "dep:tower", "dep:tower-http", "dep:tracing", "dep:tracing-subscriber", "dep:base64"]
 web = ["dioxus/web"]
 desktop = ["dioxus/desktop"]
 
