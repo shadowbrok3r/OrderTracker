@@ -676,10 +676,21 @@ fn App() -> Element {
     }
 }
 
+fn ring_num(s: &Option<String>) -> f64 {
+    s.as_deref()
+        .map(|x| {
+            let digits: String = x.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect();
+            digits.trim_matches('.').parse().unwrap_or(0.0)
+        })
+        .unwrap_or(0.0)
+}
+
 #[component]
 fn CatalogView(catalog: Vec<CatalogPiece>) -> Element {
     let total_pieces = catalog.len();
     let total_rows: usize = catalog.iter().map(|p| p.sizes.len()).sum();
+    let mut sorted = catalog.clone();
+    sorted.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     rsx! {
         div { class: "card-cosmic p-6 mb-6",
             div { class: "flex items-center justify-between flex-wrap gap-3",
@@ -693,27 +704,56 @@ fn CatalogView(catalog: Vec<CatalogPiece>) -> Element {
             }
         } else {
             div { class: "card-cosmic overflow-hidden",
-                div { class: "overflow-x-auto",
-                    table { class: "table-cosmic table-orders",
-                        thead {
-                            tr {
-                                th { "Piece" }
-                                th { "Type" }
-                                th { "Size" }
-                                th { title: "Volume (cm\u{00b3})", "Vol" }
-                                th { title: "Silver weight (g)", "Ag g" }
-                                th { title: "Silver cost", "Ag $" }
-                                th { title: "14K gold cost", "Au $" }
-                                th { title: "Bronze cost", "Bz $" }
-                                th { title: "Wax cost", "Wax $" }
-                            }
+                for piece in sorted.iter() {
+                    CatalogPieceCard { piece: piece.clone() }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn CatalogPieceCard(piece: CatalogPiece) -> Element {
+    let kind_class = if piece.kind == "ring" { "badge badge-nebula" } else { "badge badge-method" };
+    let n = piece.sizes.len();
+    let mut sizes = piece.sizes.clone();
+    sizes.sort_by(|a, b| ring_num(&a.ring_size).partial_cmp(&ring_num(&b.ring_size)).unwrap_or(std::cmp::Ordering::Equal));
+    let silvers: Vec<f64> = piece.sizes.iter().filter_map(|s| s.silver_usd).collect();
+    let range = if silvers.is_empty() {
+        "\u{2014}".to_string()
+    } else {
+        let lo = silvers.iter().cloned().fold(f64::INFINITY, f64::min);
+        let hi = silvers.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        if (hi - lo).abs() < 0.005 {
+            format!("Ag $ {:.2}", lo)
+        } else {
+            format!("Ag $ {:.0}\u{2013}{:.0}", lo, hi)
+        }
+    };
+    rsx! {
+        details { class: "catalog-piece",
+            summary { class: "catalog-summary",
+                span { class: "font-semibold text-star-white", "{piece.name}" }
+                span { class: "{kind_class}", "{piece.kind}" }
+                span { class: "text-stardust text-sm", "{n} sizes" }
+                span { class: "text-stardust text-sm catalog-range", "{range}" }
+            }
+            div { class: "overflow-x-auto",
+                table { class: "table-cosmic table-orders",
+                    thead {
+                        tr {
+                            th { "Size" }
+                            th { title: "Volume (cm\u{00b3})", "Vol" }
+                            th { title: "Silver weight (g)", "Ag g" }
+                            th { title: "Silver cost", "Ag $" }
+                            th { title: "14K gold cost", "Au $" }
+                            th { title: "Bronze cost", "Bz $" }
+                            th { title: "Wax cost", "Wax $" }
                         }
-                        tbody {
-                            for piece in catalog.iter() {
-                                for s in piece.sizes.iter() {
-                                    CatalogRow { name: piece.name.clone(), kind: piece.kind.clone(), size: s.clone() }
-                                }
-                            }
+                    }
+                    tbody {
+                        for s in sizes.iter() {
+                            CatalogRow { size: s.clone() }
                         }
                     }
                 }
@@ -723,11 +763,10 @@ fn CatalogView(catalog: Vec<CatalogPiece>) -> Element {
 }
 
 #[component]
-fn CatalogRow(name: String, kind: String, size: PieceCostSize) -> Element {
+fn CatalogRow(size: PieceCostSize) -> Element {
     let fmt = |v: Option<f64>| v.map(|x| format!("{:.2}", x)).unwrap_or_else(|| "\u{2014}".to_string());
     let money = |v: Option<f64>| v.map(|x| format!("$ {:.2}", x)).unwrap_or_else(|| "\u{2014}".to_string());
     let ring = size.ring_size.clone().unwrap_or_default();
-    let kind_class = if kind == "ring" { "badge badge-nebula" } else { "badge badge-method" };
     let (vol, ag_g, ag, au, bz, wax) = (
         fmt(size.volume_cm3),
         fmt(size.silver_g),
@@ -738,8 +777,6 @@ fn CatalogRow(name: String, kind: String, size: PieceCostSize) -> Element {
     );
     rsx! {
         tr {
-            td { class: "td-nowrap font-semibold text-star-white", "{name}" }
-            td { class: "td-nowrap", span { class: "{kind_class}", "{kind}" } }
             td { class: "td-nowrap font-mono text-aurora-purple", "{ring}" }
             td { class: "td-nowrap text-stardust", "{vol}" }
             td { class: "td-nowrap text-stardust", "{ag_g}" }

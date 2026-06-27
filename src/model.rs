@@ -159,6 +159,26 @@ fn ring_size_key(s: &str) -> String {
     }
 }
 
+/// Extract a US ring size from a variant/property string and format it as
+/// "{n} US" (e.g. "Ring Size: 9" -> "9 US", "Silver / 9" -> "9 US"). Only a
+/// whole token that parses to 3.0..=16.0 counts, so metal karats ("14k") and
+/// chain lengths ("9 inch") are ignored.
+pub fn format_ring_size(raw: &str) -> Option<String> {
+    fn as_us(t: &str) -> Option<String> {
+        let v: f64 = t.trim().parse().ok()?;
+        if !(3.0..=16.0).contains(&v) {
+            return None;
+        }
+        let n = if v.fract() == 0.0 { format!("{}", v as i64) } else { format!("{}", v) };
+        Some(format!("{} US", n))
+    }
+    if let Some(s) = as_us(raw) {
+        return Some(s);
+    }
+    raw.split(|c| c == '/' || c == ',' || c == '|' || c == ':')
+        .find_map(as_us)
+}
+
 fn pick_cost_weight_size(s: &PieceCostSize, metal: &MetalType) -> Option<ItemCostWeight> {
     let (cost, weight) = match metal {
         MetalType::Silver => (s.silver_usd.unwrap_or(0.0), s.silver_g.unwrap_or(0.0)),

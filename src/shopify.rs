@@ -86,27 +86,34 @@ struct ShopifyAddress {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn extract_ring_size(name: &str, properties: &Option<Vec<ShopifyProperty>>) -> Option<String> {
+fn extract_ring_size(
+    variant_title: &Option<String>,
+    name: &str,
+    properties: &Option<Vec<ShopifyProperty>>,
+) -> Option<String> {
+    // 1) explicit size/ring line-item property
     if let Some(props) = properties {
         for prop in props {
-            let prop_name_lower = prop.name.to_lowercase();
-            if prop_name_lower.contains("size") || prop_name_lower.contains("ring") {
-                return Some(prop.value.clone());
+            let n = prop.name.to_lowercase();
+            if n.contains("size") || n.contains("ring") {
+                if let Some(s) = crate::model::format_ring_size(&prop.value) {
+                    return Some(s);
+                }
             }
         }
     }
+    // 2) the variant title (e.g. "9", "Silver / 9", "Size 9")
+    if let Some(vt) = variant_title {
+        if let Some(s) = crate::model::format_ring_size(vt) {
+            return Some(s);
+        }
+    }
+    // 3) a "size N" token in the product name
     let lower = name.to_lowercase();
-    let patterns = ["size ", "ring size ", "sz ", "us ", "uk "];
-    for pattern in patterns {
-        if let Some(idx) = lower.find(pattern) {
-            let start = idx + pattern.len();
-            let remaining = &name[start..];
-            let size: String = remaining
-                .chars()
-                .take_while(|c| c.is_numeric() || *c == '.' || *c == '/' || *c == ' ')
-                .collect();
-            if !size.trim().is_empty() {
-                return Some(size.trim().to_string());
+    for pat in ["ring size ", "size ", "sz "] {
+        if let Some(idx) = lower.find(pat) {
+            if let Some(s) = crate::model::format_ring_size(&name[idx + pat.len()..]) {
+                return Some(s);
             }
         }
     }
@@ -219,7 +226,7 @@ pub async fn fetch_shopify_orders() -> Result<Vec<Order>, String> {
                         li.variant_title.clone().unwrap_or_default()
                     );
                     let metal_type = MetalType::from_string(&full_name);
-                    let ring_size = extract_ring_size(&full_name, &li.properties);
+                    let ring_size = extract_ring_size(&li.variant_title, &li.name, &li.properties);
                     let image_url = li.product_id.and_then(|id| image_urls.get(&id).cloned());
                     OrderItem {
                         name: li.name,

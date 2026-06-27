@@ -398,7 +398,7 @@ pub async fn fetch_etsy_orders() -> Result<Vec<Order>, String> {
                         .find(|s| {
                             s.to_lowercase().contains("ring") || s.to_lowercase().contains("size")
                         })
-                        .cloned();
+                        .and_then(|s| crate::model::format_ring_size(s));
 
                     let image_url = t
                         .listing_id

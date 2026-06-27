@@ -54,33 +54,148 @@ pub async fn ensure_db_init() -> Result<(), String> {
         .map(|_| ())
 }
 
+use crate::model::{MetalType, Order, OrderItem, OrderSource};
+use surrealdb_types::File;
+
+fn metal_tag(m: &MetalType) -> &'static str {
+    match m {
+        MetalType::Gold => "gold",
+        MetalType::Silver => "silver",
+        MetalType::Bronze => "bronze",
+        MetalType::Unknown => "unknown",
+    }
+}
+
+fn source_tag(s: &OrderSource) -> &'static str {
+    match s {
+        OrderSource::Shopify => "shopify",
+        OrderSource::Etsy => "etsy",
+    }
+}
+
+/// An order item as stored in SurrealDB: image is a native `record<file>`
+/// pointer into the thumbnails bucket, not a string.
+#[derive(SurrealValue)]
+struct CachedItem {
+    name: String,
+    quantity: i64,
+    price: f64,
+    metal: String,
+    ring_size: Option<String>,
+    variant_info: Option<String>,
+    image: Option<File>,
+}
+
+impl CachedItem {
+    fn from_item(it: &OrderItem) -> Self {
+        // image_url is "thumb/<key>" once cached; turn it into a file pointer.
+        let image = it
+            .image_url
+            .as_deref()
+            .and_then(|u| u.strip_prefix("thumb/"))
+            .map(|key| File::new(THUMB_BUCKET, key));
+        CachedItem {
+            name: it.name.clone(),
+            quantity: it.quantity as i64,
+            price: it.price,
+            metal: metal_tag(&it.metal_type).to_string(),
+            ring_size: it.ring_size.clone(),
+            variant_info: it.variant_info.clone(),
+            image,
+        }
+    }
+
+    fn into_item(self) -> OrderItem {
+        let image_url = self
+            .image
+            .map(|f| format!("thumb/{}", f.key().trim_start_matches('/')));
+        OrderItem {
+            name: self.name,
+            quantity: self.quantity.max(0) as u32,
+            price: self.price,
+            metal_type: MetalType::from_string(&self.metal),
+            ring_size: self.ring_size,
+            variant_info: self.variant_info,
+            image_url,
+        }
+    }
+}
+
+/// An order stored as a real SurrealDB object (the `payload`).
+#[derive(SurrealValue)]
+struct CachedOrder {
+    order_id: String,
+    source: String,
+    order_number: String,
+    customer_name: String,
+    items: Vec<CachedItem>,
+    order_date: chrono::DateTime<chrono::Utc>,
+    due_date: chrono::DateTime<chrono::Utc>,
+    total_price: f64,
+    currency: String,
+    status: String,
+    shipping_address: Option<String>,
+}
+
+impl CachedOrder {
+    fn from_order(o: &Order) -> Self {
+        CachedOrder {
+            order_id: o.id.clone(),
+            source: source_tag(&o.source).to_string(),
+            order_number: o.order_number.clone(),
+            customer_name: o.customer_name.clone(),
+            items: o.items.iter().map(CachedItem::from_item).collect(),
+            order_date: o.order_date,
+            due_date: o.due_date,
+            total_price: o.total_price,
+            currency: o.currency.clone(),
+            status: o.status.clone(),
+            shipping_address: o.shipping_address.clone(),
+        }
+    }
+
+    fn into_order(self) -> Order {
+        Order {
+            id: self.order_id,
+            source: if self.source == "etsy" { OrderSource::Etsy } else { OrderSource::Shopify },
+            order_number: self.order_number,
+            customer_name: self.customer_name,
+            items: self.items.into_iter().map(CachedItem::into_item).collect(),
+            order_date: self.order_date,
+            due_date: self.due_date,
+            total_price: self.total_price,
+            currency: self.currency,
+            status: self.status,
+            shipping_address: self.shipping_address,
+        }
+    }
+}
+
 #[derive(SurrealValue)]
 struct OrderCacheRow {
     source: String,
     order_number: String,
-    payload: String,
+    payload: CachedOrder,
 }
 
-/// JSON payloads of orders cached within the last day (empty = stale/miss).
-pub async fn load_cached_orders() -> Result<Vec<String>, String> {
+/// Orders cached within the last day (empty = stale/miss).
+pub async fn load_cached_orders() -> Result<Vec<Order>, String> {
     let mut res = DB
         .query("SELECT VALUE payload FROM orders WHERE fetched_at > time::now() - 1d")
         .await
         .map_err(|e| e.to_string())?;
-    res.take(0).map_err(|e| e.to_string())
+    let cached: Vec<CachedOrder> = res.take(0).map_err(|e| e.to_string())?;
+    Ok(cached.into_iter().map(CachedOrder::into_order).collect())
 }
 
 /// Replace the order cache with the given set (fetched_at set to now).
-pub async fn save_orders(orders: &[crate::model::Order]) -> Result<(), String> {
+pub async fn save_orders(orders: &[Order]) -> Result<(), String> {
     let rows: Vec<OrderCacheRow> = orders
         .iter()
         .map(|o| OrderCacheRow {
-            source: match o.source {
-                crate::model::OrderSource::Shopify => "shopify".to_string(),
-                crate::model::OrderSource::Etsy => "etsy".to_string(),
-            },
+            source: source_tag(&o.source).to_string(),
             order_number: o.order_number.clone(),
-            payload: serde_json::to_string(o).unwrap_or_default(),
+            payload: CachedOrder::from_order(o),
         })
         .collect();
     DB.query("DELETE orders; INSERT INTO orders $rows")

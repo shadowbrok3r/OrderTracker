@@ -61,14 +61,10 @@ async fn cache_thumbnails(orders: &mut [Order]) {
 #[server]
 pub async fn fetch_all_orders() -> Result<FetchOrdersResult, ServerFnError> {
     if crate::db::ensure_db_init().await.is_ok() {
-        if let Ok(payloads) = crate::db::load_cached_orders().await {
-            if !payloads.is_empty() {
-                let orders: Vec<Order> =
-                    payloads.iter().filter_map(|p| serde_json::from_str(p).ok()).collect();
-                if !orders.is_empty() {
-                    crate::log::app_log("INFO", format!("Served {} orders from cache.", orders.len()));
-                    return Ok(FetchOrdersResult { orders, errors: Vec::new() });
-                }
+        if let Ok(orders) = crate::db::load_cached_orders().await {
+            if !orders.is_empty() {
+                crate::log::app_log("INFO", format!("Served {} orders from cache.", orders.len()));
+                return Ok(FetchOrdersResult { orders, errors: Vec::new() });
             }
         }
     }
