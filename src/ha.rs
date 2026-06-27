@@ -88,21 +88,29 @@ pub async fn push_orders(orders: &[Order]) {
         serde_json::json!({ "friendly_name": "Open order revenue", "unit_of_measurement": "USD", "state_class": "measurement", "icon": "mdi:cash" })).await;
 
     if let Ok(seen) = crate::db::load_seen_keys().await {
+        // First run adopts all current orders silently (no event flood); the
+        // __baseline__ sentinel records initialization even with zero orders.
+        let initialized = seen.contains("__baseline__");
         let mut newly = Vec::new();
         for o in &open {
             let key = o.state_key();
             if seen.contains(&key) {
                 continue;
             }
-            fire_event(&client, &token, "ordertracker_new_order", serde_json::json!({
-                "order": o.order_number,
-                "customer": o.customer_name,
-                "source": src_str(&o.source),
-                "due": o.due_date.format("%Y-%m-%d").to_string(),
-                "total": o.total_price,
-                "items": o.items.iter().map(|i| i.name.clone()).collect::<Vec<_>>(),
-            })).await;
+            if initialized {
+                fire_event(&client, &token, "ordertracker_new_order", serde_json::json!({
+                    "order": o.order_number,
+                    "customer": o.customer_name,
+                    "source": src_str(&o.source),
+                    "due": o.due_date.format("%Y-%m-%d").to_string(),
+                    "total": o.total_price,
+                    "items": o.items.iter().map(|i| i.name.clone()).collect::<Vec<_>>(),
+                })).await;
+            }
             newly.push(key);
+        }
+        if !initialized {
+            newly.push("__baseline__".to_string());
         }
         if !newly.is_empty() {
             let _ = crate::db::mark_seen(&newly).await;
