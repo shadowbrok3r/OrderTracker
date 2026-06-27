@@ -16,7 +16,7 @@ pub struct FetchOrdersResult {
 /// Fetch live from Shopify + Etsy (errors collected per source) and replace the
 /// SurrealDB order cache.
 #[cfg(feature = "server")]
-async fn live_fetch_and_cache() -> FetchOrdersResult {
+pub(crate) async fn live_fetch_and_cache() -> FetchOrdersResult {
     let mut all_orders = Vec::new();
     let mut errors = Vec::new();
 
@@ -64,25 +64,36 @@ async fn cache_thumbnails(orders: &mut [Order]) {
 }
 
 /// Return cached orders if fresh (< 1 day), otherwise fetch live and cache.
-#[server]
-pub async fn fetch_all_orders() -> Result<FetchOrdersResult, ServerFnError> {
+/// Cache-aware order fetch (no HA push) shared by the server fn and the
+/// background HA-refresh loop.
+#[cfg(feature = "server")]
+async fn fetch_orders_internal() -> FetchOrdersResult {
     if crate::db::ensure_db_init().await.is_ok() {
         if let Ok(base) = crate::db::load_cached_orders().await {
             if !base.is_empty() {
                 let mut orders = crate::db::merge_orders(base).await;
                 orders.sort_by(|a, b| a.due_date.cmp(&b.due_date));
                 crate::log::app_log("INFO", format!("Served {} orders from cache.", orders.len()));
-                return Ok(FetchOrdersResult { orders, errors: Vec::new() });
+                return FetchOrdersResult { orders, errors: Vec::new() };
             }
         }
     }
-    Ok(live_fetch_and_cache().await)
+    live_fetch_and_cache().await
+}
+
+#[server]
+pub async fn fetch_all_orders() -> Result<FetchOrdersResult, ServerFnError> {
+    let result = fetch_orders_internal().await;
+    crate::ha::push_orders(&result.orders).await;
+    Ok(result)
 }
 
 /// Force a live Shopify + Etsy fetch and refresh the cache (manual Refresh).
 #[server]
 pub async fn refresh_orders() -> Result<FetchOrdersResult, ServerFnError> {
-    Ok(live_fetch_and_cache().await)
+    let result = live_fetch_and_cache().await;
+    crate::ha::push_orders(&result.orders).await;
+    Ok(result)
 }
 
 /// Load the jewelry catalog (pieces + linked sizes) from SurrealDB.

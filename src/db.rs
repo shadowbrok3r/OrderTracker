@@ -307,6 +307,32 @@ pub async fn merge_orders(mut base: Vec<Order>) -> Vec<Order> {
     base
 }
 
+/// Order keys already announced to Home Assistant.
+pub async fn load_seen_keys() -> Result<std::collections::HashSet<String>, String> {
+    let mut res = DB
+        .query("SELECT VALUE <string>id FROM seen_orders")
+        .await
+        .map_err(|e| e.to_string())?;
+    let ids: Vec<String> = res.take(0).map_err(|e| e.to_string())?;
+    Ok(ids
+        .into_iter()
+        .map(|i| i.strip_prefix("seen_orders:").unwrap_or(&i).to_string())
+        .collect())
+}
+
+/// Mark order keys as announced.
+pub async fn mark_seen(keys: &[String]) -> Result<(), String> {
+    for key in keys {
+        DB.query("UPSERT type::record('seen_orders', $key) SET seen_at = time::now()")
+            .bind(("key", key.clone()))
+            .await
+            .map_err(|e| e.to_string())?
+            .check()
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Thumbnail bucket (cached Shopify/Etsy product images)
 // ---------------------------------------------------------------------------

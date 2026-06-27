@@ -6,6 +6,8 @@ mod components;
 mod db;
 #[cfg(feature = "server")]
 mod etsy;
+#[cfg(feature = "server")]
+mod ha;
 mod log;
 mod model;
 #[cfg(feature = "server")]
@@ -206,6 +208,18 @@ fn server_main() {
         .block_on(async {
             // Honors IP/PORT env (the run script sets 0.0.0.0:8099).
             let addr = dioxus::cli_config::fullstack_address_or_localhost();
+
+            // Keep HA sensors current: refresh from Shopify/Etsy + push every 6h.
+            tokio::spawn(async {
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                loop {
+                    if crate::db::ensure_db_init().await.is_ok() {
+                        let result = crate::api::live_fetch_and_cache().await;
+                        crate::ha::push_orders(&result.orders).await;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
+                }
+            });
 
             let app: Router = Router::new()
                 .serve_dioxus_application(ServeConfig::new(), App)
