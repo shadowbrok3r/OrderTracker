@@ -443,6 +443,8 @@ pub async fn fetch_etsy_orders() -> Result<Vec<Order>, String> {
                 currency,
                 status: r.status.unwrap_or_else(|| "open".to_string()),
                 shipping_address,
+                archived: false,
+                completed: false,
             })
         })
         .collect();

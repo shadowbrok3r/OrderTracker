@@ -33,6 +33,7 @@ enum ViewFilter {
     Shopify,
     Etsy,
     Urgent,
+    Archived,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -309,10 +310,11 @@ fn App() -> Element {
             .iter()
             .filter(|order| {
                 let passes_filter = match *view_filter.read() {
-                    ViewFilter::All => true,
-                    ViewFilter::Shopify => matches!(order.source, OrderSource::Shopify),
-                    ViewFilter::Etsy => matches!(order.source, OrderSource::Etsy),
-                    ViewFilter::Urgent => order.days_until_due() <= 3,
+                    ViewFilter::All => !order.archived,
+                    ViewFilter::Shopify => !order.archived && matches!(order.source, OrderSource::Shopify),
+                    ViewFilter::Etsy => !order.archived && matches!(order.source, OrderSource::Etsy),
+                    ViewFilter::Urgent => !order.archived && order.days_until_due() <= 3,
+                    ViewFilter::Archived => order.archived,
                 };
                 let query = search_query.read().to_lowercase();
                 let passes_search = query.is_empty()
@@ -341,6 +343,22 @@ fn App() -> Element {
         (total, shopify, etsy, urgent, overdue)
     });
 
+    // Total silver to buy: catalog weight for every open (non-archived, non-completed)
+    // non-bronze item (gold-plated pieces are cast in silver too).
+    let silver_needed = use_memo(move || {
+        let cat = catalog.read();
+        orders
+            .read()
+            .iter()
+            .filter(|o| !o.archived && !o.completed)
+            .flat_map(|o| o.items.iter())
+            .filter(|item| item.metal_type != MetalType::Bronze)
+            .filter_map(|item| {
+                lookup_piece_cost(item, &cat).map(|cw| cw.weight_g * item.quantity as f64)
+            })
+            .sum::<f64>()
+    });
+
     let orders_for_table = use_memo(move || {
         filtered_orders
             .read()
@@ -348,6 +366,8 @@ fn App() -> Element {
             .map(|o| (o.clone(), o.clone()))
             .collect::<Vec<(Order, Order)>>()
     });
+
+    let silver_txt = format!("{:.0} g Ag to buy", silver_needed());
 
     rsx! {
         document::Stylesheet { href: asset!("/assets/styles.css") }
@@ -371,6 +391,7 @@ fn App() -> Element {
                             span { "{stats.read().2} Etsy" }
                             span { "{stats.read().3} urgent" }
                             span { "{stats.read().4} overdue" }
+                            span { class: "text-comet-gold font-semibold", "{silver_txt}" }
                         }
                     }
                     div { class: "flex items-center gap-3",
@@ -548,7 +569,23 @@ fn App() -> Element {
                             OrderDetailDialog {
                                 order: order.clone(),
                                 catalog: catalog.read().clone(),
-                                on_close: move |_| detail_order.set(None)
+                                on_close: move |_| detail_order.set(None),
+                                on_set_state: move |(key, archived, completed): (String, bool, bool)| {
+                                    let k = key.clone();
+                                    spawn(async move {
+                                        if let Err(e) = api::set_order_state(k, archived, completed).await {
+                                            log::app_log("ERROR", format!("Set order state: {}", e));
+                                        }
+                                    });
+                                    {
+                                        let mut os = orders.write();
+                                        if let Some(o) = os.iter_mut().find(|o| o.state_key() == key) {
+                                            o.archived = archived;
+                                            o.completed = completed;
+                                        }
+                                    }
+                                    detail_order.set(None);
+                                }
                             }
                         }
                     } else {
@@ -589,6 +626,11 @@ fn App() -> Element {
                                 label: "Urgent",
                                 active: *view_filter.read() == ViewFilter::Urgent,
                                 onclick: move |_| view_filter.set(ViewFilter::Urgent)
+                            }
+                            FilterButton {
+                                label: "Archived",
+                                active: *view_filter.read() == ViewFilter::Archived,
+                                onclick: move |_| view_filter.set(ViewFilter::Archived)
                             }
                         }
                         div { class: "flex items-center gap-2",
@@ -820,6 +862,7 @@ fn OrderRow(
     let source_badge = match order.source {
         OrderSource::Shopify => ("Shopify", "badge-method"),
         OrderSource::Etsy => ("Etsy", "badge-nebula"),
+        OrderSource::Custom => ("Custom", "badge-success"),
     };
     let primary_metal = order
         .items
@@ -955,10 +998,12 @@ fn OrderDetailDialog(
     order: Order,
     catalog: Vec<CatalogPiece>,
     on_close: EventHandler<MouseEvent>,
+    on_set_state: EventHandler<(String, bool, bool)>,
 ) -> Element {
     let source_label = match order.source {
         OrderSource::Shopify => "Shopify",
         OrderSource::Etsy => "Etsy",
+        OrderSource::Custom => "Custom",
     };
     let days_left = order.days_until_due();
     let days_display = if days_left < 0 {
@@ -971,14 +1016,30 @@ fn OrderDetailDialog(
         format!("{} days left", days_left)
     };
     let total_str = format!("{} {:.2}", order.currency, order.total_price);
+    let archived = order.archived;
+    let completed = order.completed;
+    let complete_label = if completed { "Reopen" } else { "Complete" };
+    let archive_label = if archived { "Unarchive" } else { "Archive" };
+    let key_complete = order.state_key();
+    let key_archive = order.state_key();
 
     rsx! {
-        div { class: "flex items-center justify-between mb-4",
+        div { class: "flex items-center justify-between mb-4 flex-wrap gap-2",
             h2 { class: "text-xl font-bold text-star-white",
                 "{order.order_number}"
             }
-            div { class: "flex items-center gap-2",
+            div { class: "flex items-center gap-2 flex-wrap",
                 span { class: "badge badge-nebula", "{source_label}" }
+                button {
+                    class: "btn-cosmic text-sm",
+                    onclick: move |_| on_set_state.call((key_complete.clone(), archived, !completed)),
+                    "{complete_label}"
+                }
+                button {
+                    class: "btn-cosmic text-sm",
+                    onclick: move |_| on_set_state.call((key_archive.clone(), !archived, completed)),
+                    "{archive_label}"
+                }
                 button {
                     class: "btn-cosmic text-sm",
                     onclick: move |evt| on_close.call(evt),
@@ -993,6 +1054,7 @@ fn OrderDetailDialog(
                 }
             },
             OrderSource::Shopify => rsx! { },
+            OrderSource::Custom => rsx! { },
         }}
         dl { class: "detail-grid",
             dt { "Customer" }

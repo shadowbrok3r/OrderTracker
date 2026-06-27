@@ -263,6 +263,8 @@ pub async fn fetch_shopify_orders() -> Result<Vec<Order>, String> {
                 currency: so.currency,
                 status: so.fulfillment_status.unwrap_or_else(|| "unfulfilled".to_string()),
                 shipping_address,
+                archived: false,
+                completed: false,
             }
         })
         .collect();

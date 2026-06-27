@@ -30,13 +30,19 @@ async fn live_fetch_and_cache() -> FetchOrdersResult {
     }
     all_orders.sort_by(|a, b| a.due_date.cmp(&b.due_date));
 
-    if !all_orders.is_empty() && crate::db::ensure_db_init().await.is_ok() {
-        cache_thumbnails(&mut all_orders).await;
-        if let Err(e) = crate::db::save_orders(&all_orders).await {
-            crate::log::app_log("INFO", format!("Order cache write failed: {}", e));
+    let mut orders = if crate::db::ensure_db_init().await.is_ok() {
+        if !all_orders.is_empty() {
+            cache_thumbnails(&mut all_orders).await;
+            if let Err(e) = crate::db::save_orders(&all_orders).await {
+                crate::log::app_log("INFO", format!("Order cache write failed: {}", e));
+            }
         }
-    }
-    FetchOrdersResult { orders: all_orders, errors }
+        crate::db::merge_orders(all_orders).await
+    } else {
+        all_orders
+    };
+    orders.sort_by(|a, b| a.due_date.cmp(&b.due_date));
+    FetchOrdersResult { orders, errors }
 }
 
 /// Download each order item's source image into the SurrealDB thumbnails bucket
@@ -61,8 +67,10 @@ async fn cache_thumbnails(orders: &mut [Order]) {
 #[server]
 pub async fn fetch_all_orders() -> Result<FetchOrdersResult, ServerFnError> {
     if crate::db::ensure_db_init().await.is_ok() {
-        if let Ok(orders) = crate::db::load_cached_orders().await {
-            if !orders.is_empty() {
+        if let Ok(base) = crate::db::load_cached_orders().await {
+            if !base.is_empty() {
+                let mut orders = crate::db::merge_orders(base).await;
+                orders.sort_by(|a, b| a.due_date.cmp(&b.due_date));
                 crate::log::app_log("INFO", format!("Served {} orders from cache.", orders.len()));
                 return Ok(FetchOrdersResult { orders, errors: Vec::new() });
             }
@@ -92,5 +100,23 @@ pub async fn fetch_catalog() -> Result<Vec<CatalogPiece>, ServerFnError> {
 #[server]
 pub async fn save_etsy_token(token: String) -> Result<(), ServerFnError> {
     crate::etsy::save_etsy_refresh_token(token)
+        .map_err(|e| ServerFnError::new(e))
+}
+
+/// Archive/complete an order (persisted overlay; key = Order::state_key).
+#[server]
+pub async fn set_order_state(key: String, archived: bool, completed: bool) -> Result<(), ServerFnError> {
+    crate::db::ensure_db_init().await.map_err(|e| ServerFnError::new(e))?;
+    crate::db::set_order_state(&key, archived, completed)
+        .await
+        .map_err(|e| ServerFnError::new(e))
+}
+
+/// Create a manual/custom order (not from Shopify/Etsy).
+#[server]
+pub async fn create_custom_order(order: Order) -> Result<(), ServerFnError> {
+    crate::db::ensure_db_init().await.map_err(|e| ServerFnError::new(e))?;
+    crate::db::save_custom_order(&order)
+        .await
         .map_err(|e| ServerFnError::new(e))
 }

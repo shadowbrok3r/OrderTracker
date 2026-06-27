@@ -70,6 +70,7 @@ fn source_tag(s: &OrderSource) -> &'static str {
     match s {
         OrderSource::Shopify => "shopify",
         OrderSource::Etsy => "etsy",
+        OrderSource::Custom => "custom",
     }
 }
 
@@ -157,7 +158,11 @@ impl CachedOrder {
     fn into_order(self) -> Order {
         Order {
             id: self.order_id,
-            source: if self.source == "etsy" { OrderSource::Etsy } else { OrderSource::Shopify },
+            source: match self.source.as_str() {
+                "etsy" => OrderSource::Etsy,
+                "custom" => OrderSource::Custom,
+                _ => OrderSource::Shopify,
+            },
             order_number: self.order_number,
             customer_name: self.customer_name,
             items: self.items.into_iter().map(CachedItem::into_item).collect(),
@@ -167,6 +172,8 @@ impl CachedOrder {
             currency: self.currency,
             status: self.status,
             shipping_address: self.shipping_address,
+            archived: false,
+            completed: false,
         }
     }
 }
@@ -205,6 +212,99 @@ pub async fn save_orders(orders: &[Order]) -> Result<(), String> {
         .check()
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Order state overlay + custom orders
+// ---------------------------------------------------------------------------
+
+#[derive(SurrealValue)]
+struct OrderStateRow {
+    rid: String,
+    archived: bool,
+    completed: bool,
+}
+
+/// Map of state_key -> (archived, completed) from the persistent order_state table.
+pub async fn load_order_state() -> Result<std::collections::HashMap<String, (bool, bool)>, String> {
+    let mut res = DB
+        .query("SELECT <string>id AS rid, archived, completed FROM order_state")
+        .await
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<OrderStateRow> = res.take(0).map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let key = r.rid.strip_prefix("order_state:").unwrap_or(&r.rid).to_string();
+            (key, (r.archived, r.completed))
+        })
+        .collect())
+}
+
+/// Set archive/complete flags for an order key (e.g. "shopify_123", "custom_abc").
+pub async fn set_order_state(key: &str, archived: bool, completed: bool) -> Result<(), String> {
+    DB.query("UPSERT type::record('order_state', $key) SET archived = $a, completed = $c")
+        .bind(("key", key.to_string()))
+        .bind(("a", archived))
+        .bind(("c", completed))
+        .await
+        .map_err(|e| e.to_string())?
+        .check()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[derive(SurrealValue)]
+struct CustomRow {
+    rid: String,
+    payload: CachedOrder,
+}
+
+/// All custom orders, each with id = the custom_orders record key and source = Custom.
+pub async fn load_custom_orders() -> Result<Vec<Order>, String> {
+    let mut res = DB
+        .query("SELECT <string>id AS rid, payload FROM custom_orders")
+        .await
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<CustomRow> = res.take(0).map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let mut o = r.payload.into_order();
+            o.source = OrderSource::Custom;
+            o.id = r.rid.strip_prefix("custom_orders:").unwrap_or(&r.rid).to_string();
+            o
+        })
+        .collect())
+}
+
+/// Persist a new custom order.
+pub async fn save_custom_order(order: &Order) -> Result<(), String> {
+    let payload = CachedOrder::from_order(order);
+    DB.query("CREATE custom_orders SET payload = $payload")
+        .bind(("payload", payload))
+        .await
+        .map_err(|e| e.to_string())?
+        .check()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Merge live/cached Shopify+Etsy orders with custom orders, then apply the
+/// archive/complete overlay from order_state.
+pub async fn merge_orders(mut base: Vec<Order>) -> Vec<Order> {
+    if let Ok(custom) = load_custom_orders().await {
+        base.extend(custom);
+    }
+    if let Ok(state) = load_order_state().await {
+        for o in base.iter_mut() {
+            if let Some(&(archived, completed)) = state.get(&o.state_key()) {
+                o.archived = archived;
+                o.completed = completed;
+            }
+        }
+    }
+    base
 }
 
 // ---------------------------------------------------------------------------

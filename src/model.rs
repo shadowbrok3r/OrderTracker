@@ -51,6 +51,7 @@ impl MetalType {
 pub enum OrderSource {
     Shopify,
     Etsy,
+    Custom,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -66,9 +67,23 @@ pub struct Order {
     pub currency: String,
     pub status: String,
     pub shipping_address: Option<String>,
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub completed: bool,
 }
 
 impl Order {
+    /// Stable key for the persistent order_state overlay (e.g. "shopify_123").
+    pub fn state_key(&self) -> String {
+        let src = match self.source {
+            OrderSource::Shopify => "shopify",
+            OrderSource::Etsy => "etsy",
+            OrderSource::Custom => "custom",
+        };
+        format!("{}_{}", src, self.id)
+    }
+
     pub fn days_until_due(&self) -> i64 {
         let now = Utc::now();
         (self.due_date - now).num_days()
