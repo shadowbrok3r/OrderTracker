@@ -4,7 +4,7 @@
 CONFIG_PATH=/data/options.json
 
 if [ -f "$CONFIG_PATH" ]; then
-    for key in SURREAL_URL SURREAL_USER SURREAL_PASS SHOPIFY_URL SHOPIFY_ACCESS_TOKEN ETSY_KEYSTRING ETSY_SECRET ETSY_SHOP_ID; do
+    for key in SURREAL_URL SURREAL_USER SURREAL_PASS SHOPIFY_URL SHOPIFY_ACCESS_TOKEN ETSY_KEYSTRING ETSY_SECRET ETSY_SHOP_ID KILN_ENTITY KILN_FIRING_STATE; do
         val=$(bashio::jq "$CONFIG_PATH" ".$key // empty")
         if [ -n "$val" ]; then
             export "$key=$val"

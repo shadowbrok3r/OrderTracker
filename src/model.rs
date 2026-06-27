@@ -14,17 +14,24 @@ pub enum MetalType {
 }
 
 impl MetalType {
-    /// Parse metal type from product name/variant text.
+    /// Parse metal type from product name/variant text (Unknown if no keyword).
     pub fn from_string(s: &str) -> Self {
+        Self::from_string_opt(s).unwrap_or(MetalType::Unknown)
+    }
+
+    /// Parse a metal type only when an explicit metal keyword is present.
+    /// Lets callers prefer a material/variant field over a polluted title
+    /// ("Sterling Silver Skull Ring" with a Bronze material variation).
+    pub fn from_string_opt(s: &str) -> Option<Self> {
         let lower = s.to_lowercase();
         if lower.contains("gold") || lower.contains("14k") || lower.contains("18k") || lower.contains("10k") {
-            MetalType::Gold
+            Some(MetalType::Gold)
         } else if lower.contains("silver") || lower.contains("sterling") || lower.contains("925") {
-            MetalType::Silver
+            Some(MetalType::Silver)
         } else if lower.contains("bronze") || lower.contains("brass") {
-            MetalType::Bronze
+            Some(MetalType::Bronze)
         } else {
-            MetalType::Unknown
+            None
         }
     }
 
@@ -71,7 +78,17 @@ pub struct Order {
     pub archived: bool,
     #[serde(default)]
     pub completed: bool,
+    /// Free-text production notes (SurrealDB-only overlay, not from Shopify/Etsy).
+    #[serde(default)]
+    pub notes: Option<String>,
+    /// Production stage (see [STAGES]); SurrealDB-only overlay.
+    #[serde(default)]
+    pub stage: Option<String>,
 }
+
+/// Production stages an order moves through, in order. None/"" = not started.
+/// Invested -> Burnout on kiln-on, Burnout -> Finishing on kiln-off.
+pub const STAGES: &[&str] = &["3D Printed", "Invested", "Burnout", "Finishing"];
 
 impl Order {
     /// Stable key for the persistent order_state overlay (e.g. "shopify_123").

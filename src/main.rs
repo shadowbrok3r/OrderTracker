@@ -261,6 +261,17 @@ fn server_main() {
                 }
             });
 
+            // Watch the kiln and auto-advance burnout stages on firing transitions.
+            tokio::spawn(async {
+                let mut prev_firing: Option<bool> = None;
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    if crate::db::ensure_db_init().await.is_ok() {
+                        crate::ha::kiln_poll(&mut prev_firing).await;
+                    }
+                }
+            });
+
             let app: Router = Router::new()
                 .serve_dioxus_application(ServeConfig::new(), App)
                 .route("/thumb/{key}", get(thumb_handler))
@@ -807,6 +818,8 @@ fn App() -> Element {
                                                 shipping_address: None,
                                                 archived: false,
                                                 completed: false,
+                                                notes: None,
+                                                stage: None,
                                             };
                                             spawn(async move {
                                                 match api::create_custom_order(order).await {
@@ -898,25 +911,22 @@ fn App() -> Element {
                                     }
                                     detail_order.set(None);
                                 },
-                                on_set_charge: move |(id, total): (String, f64)| {
-                                    let mut updated: Option<Order> = None;
+                                on_save_custom: move |updated: Order| {
                                     {
                                         let mut os = orders.write();
                                         if let Some(o) = os.iter_mut()
-                                            .find(|o| matches!(o.source, OrderSource::Custom) && o.id == id)
+                                            .find(|o| matches!(o.source, OrderSource::Custom) && o.id == updated.id)
                                         {
-                                            o.total_price = total;
-                                            updated = Some(o.clone());
+                                            o.items = updated.items.clone();
+                                            o.total_price = updated.total_price;
                                         }
                                     }
-                                    if let Some(o) = updated {
-                                        detail_order.set(Some(o.clone()));
-                                        spawn(async move {
-                                            if let Err(e) = api::update_custom_order(o).await {
-                                                log::app_log("ERROR", format!("Update custom order: {}", e));
-                                            }
-                                        });
-                                    }
+                                    detail_order.set(Some(updated.clone()));
+                                    spawn(async move {
+                                        if let Err(e) = api::update_custom_order(updated).await {
+                                            log::app_log("ERROR", format!("Update custom order: {}", e));
+                                        }
+                                    });
                                 },
                                 on_link: move |(piece, key): (String, String)| {
                                     spawn(async move {
@@ -930,6 +940,32 @@ fn App() -> Element {
                                             Err(e) => log::app_log("ERROR", format!("Link product: {}", e)),
                                         }
                                     });
+                                },
+                                on_set_notes: move |(key, notes): (String, String)| {
+                                    let k = key.clone();
+                                    let n = notes.clone();
+                                    spawn(async move {
+                                        if let Err(e) = api::set_order_notes(k, n).await {
+                                            log::app_log("ERROR", format!("Save notes: {}", e));
+                                        }
+                                    });
+                                    let mut os = orders.write();
+                                    if let Some(o) = os.iter_mut().find(|o| o.state_key() == key) {
+                                        o.notes = if notes.is_empty() { None } else { Some(notes) };
+                                    }
+                                },
+                                on_set_stage: move |(key, stage): (String, String)| {
+                                    let k = key.clone();
+                                    let s = stage.clone();
+                                    spawn(async move {
+                                        if let Err(e) = api::set_order_stage(k, s).await {
+                                            log::app_log("ERROR", format!("Save stage: {}", e));
+                                        }
+                                    });
+                                    let mut os = orders.write();
+                                    if let Some(o) = os.iter_mut().find(|o| o.state_key() == key) {
+                                        o.stage = if stage.is_empty() { None } else { Some(stage) };
+                                    }
                                 }
                             }
                         }
@@ -1460,6 +1496,9 @@ fn OrderRow(
                 div { class: "text-xs text-stardust",
                     "{order.order_date.format(\"%b %d, %Y\")}"
                 }
+                {order.stage.as_ref().filter(|s| !s.is_empty()).map(|s| rsx! {
+                    span { class: "badge badge-stage", "{s}" }
+                })}
             }
             td { class: "td-nowrap text-moonlight", title: "{order.customer_name}",
                 span { class: "cell-truncate", "{order.customer_name}" }
@@ -1528,8 +1567,10 @@ fn OrderDetailDialog(
     catalog: Vec<CatalogPiece>,
     on_close: EventHandler<MouseEvent>,
     on_set_state: EventHandler<(String, bool, bool)>,
-    on_set_charge: EventHandler<(String, f64)>,
+    on_save_custom: EventHandler<Order>,
     on_link: EventHandler<(String, String)>,
+    on_set_notes: EventHandler<(String, String)>,
+    on_set_stage: EventHandler<(String, String)>,
 ) -> Element {
     let source_label = match order.source {
         OrderSource::Shopify => "Shopify",
@@ -1554,14 +1595,17 @@ fn OrderDetailDialog(
     let key_complete = order.state_key();
     let key_archive = order.state_key();
     let is_custom = order.source == OrderSource::Custom;
-    let order_id = order.id.clone();
-    let mut charge_input = use_signal(|| {
-        if order.total_price > 0.0 {
-            format!("{}", order.total_price)
-        } else {
-            String::new()
-        }
+    let mut item_prices = use_signal(|| {
+        order
+            .items
+            .iter()
+            .map(|i| if i.price > 0.0 { format!("{}", i.price) } else { String::new() })
+            .collect::<Vec<String>>()
     });
+    let mut notes_input = use_signal(|| order.notes.clone().unwrap_or_default());
+    let mut stage_input = use_signal(|| order.stage.clone().unwrap_or_default());
+    let sk_stage = order.state_key();
+    let sk_notes = order.state_key();
 
     let catalog_names: Vec<String> = {
         let mut n: Vec<String> = catalog.iter().map(|p| p.name.clone()).collect();
@@ -1644,25 +1688,88 @@ fn OrderDetailDialog(
             }
             {is_custom.then(|| rsx! {
                 div { class: "mt-4",
-                    p { class: "text-stardust text-sm font-medium mb-2", "Charge (what you're billing)" }
-                    div { class: "charge-edit",
-                        span { class: "text-stardust", "$" }
-                        input {
-                            r#type: "number", min: "0", step: "0.01", placeholder: "0.00",
-                            value: "{charge_input}",
-                            oninput: move |e| charge_input.set(e.value())
+                    p { class: "text-stardust text-sm font-medium mb-2", "Item pricing (what you're charging)" }
+                    div { class: "space-y-2",
+                        for (i, it) in order.items.iter().enumerate() {
+                            div { class: "charge-edit",
+                                span { class: "text-moonlight text-sm flex-1",
+                                    "{it.name}"
+                                    {it.ring_size.as_ref().map(|s| rsx! { span { class: "text-stardust", " \u{00b7} {s}" } })}
+                                }
+                                span { class: "text-stardust", "$" }
+                                input {
+                                    r#type: "number", min: "0", step: "0.01", placeholder: "0.00",
+                                    value: "{item_prices.read().get(i).cloned().unwrap_or_default()}",
+                                    oninput: move |e| { if let Some(v) = item_prices.write().get_mut(i) { *v = e.value(); } }
+                                }
+                            }
                         }
+                    }
+                    div { class: "flex items-center justify-between mt-2",
+                        span { class: "text-stardust text-sm", "Total" }
+                        span { class: "text-star-white font-semibold",
+                            {
+                                let total: f64 = item_prices.read().iter().enumerate()
+                                    .map(|(i, p)| {
+                                        let q = order.items.get(i).map(|it| it.quantity).unwrap_or(1) as f64;
+                                        p.trim().parse::<f64>().unwrap_or(0.0) * q
+                                    })
+                                    .sum();
+                                format!("$ {:.2}", total)
+                            }
+                        }
+                    }
+                    div { class: "flex justify-end mt-2",
                         button {
                             class: "btn-nebula", r#type: "button",
-                            onclick: move |_| {
-                                let v: f64 = charge_input.read().trim().parse().unwrap_or(0.0);
-                                on_set_charge.call((order_id.clone(), v));
+                            onclick: {
+                                let base = order.clone();
+                                move |_| {
+                                    let mut o = base.clone();
+                                    let prices = item_prices.read().clone();
+                                    for (idx, it) in o.items.iter_mut().enumerate() {
+                                        it.price = prices.get(idx).and_then(|p| p.trim().parse::<f64>().ok()).unwrap_or(0.0);
+                                    }
+                                    o.total_price = o.items.iter().map(|it| it.price * it.quantity as f64).sum();
+                                    on_save_custom.call(o);
+                                }
                             },
-                            "Save charge"
+                            "Save pricing"
                         }
                     }
                 }
             })}
+            div { class: "mt-4",
+                div { class: "flex items-center gap-2 flex-wrap mb-3",
+                    span { class: "text-stardust text-sm font-medium", "Stage" }
+                    select {
+                        class: "link-select",
+                        onchange: move |e| {
+                            let v = e.value();
+                            stage_input.set(v.clone());
+                            on_set_stage.call((sk_stage.clone(), v));
+                        },
+                        option { value: "", selected: stage_input.read().is_empty(), "Not started" }
+                        for st in model::STAGES.iter() {
+                            option { value: "{st}", selected: stage_input.read().as_str() == *st, "{st}" }
+                        }
+                    }
+                }
+                p { class: "text-stardust text-sm font-medium mb-1", "Notes" }
+                textarea {
+                    class: "w-full",
+                    placeholder: "Production notes (e.g. \"in the kiln\", \"3D printed\")...",
+                    value: "{notes_input}",
+                    oninput: move |e| notes_input.set(e.value())
+                }
+                div { class: "flex justify-end mt-2",
+                    button {
+                        class: "btn-cosmic text-sm", r#type: "button",
+                        onclick: move |_| on_set_notes.call((sk_notes.clone(), notes_input.read().clone())),
+                        "Save notes"
+                    }
+                }
+            }
             {order.shipping_address.as_ref().map(|addr| rsx! {
                 div { class: "mt-4",
                     p { class: "text-stardust text-sm font-medium mb-1", "Shipping address" }

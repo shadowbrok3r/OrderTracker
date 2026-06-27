@@ -479,6 +479,7 @@ select option { background-color: var(--surface); }
 .badge-method { background: rgba(106, 168, 255, 0.14); color: var(--blue); border: 1px solid rgba(106, 168, 255, 0.35); }
 .badge-success { background: rgba(52, 211, 153, 0.14); color: #6ee7b7; border: 1px solid rgba(52, 211, 153, 0.35); }
 .badge-blocked { background: rgba(248, 113, 113, 0.14); color: #fca5a5; border: 1px solid rgba(248, 113, 113, 0.35); }
+.badge-stage { background: rgba(99, 102, 241, 0.16); color: #a5b4fc; border: 1px solid rgba(99, 102, 241, 0.4); margin-top: 0.25rem; }
 
 .badge-gold { background: linear-gradient(135deg, rgba(243, 201, 105, 0.18), rgba(201, 138, 43, 0.10)); color: var(--gold); border: 1px solid rgba(243, 201, 105, 0.4); text-shadow: 0 0 8px rgba(243, 201, 105, 0.3); }
 .badge-silver { background: linear-gradient(135deg, rgba(203, 213, 225, 0.18), rgba(148, 163, 184, 0.10)); color: #dbe2ee; border: 1px solid rgba(203, 213, 225, 0.35); text-shadow: 0 0 8px rgba(203, 213, 225, 0.25); }

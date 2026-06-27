@@ -36,6 +36,63 @@ async fn fire_event(client: &reqwest::Client, token: &str, event: &str, data: se
     let _ = client.post(&url).bearer_auth(token).json(&data).send().await;
 }
 
+/// Read a Home Assistant entity's state string via the Supervisor proxy.
+async fn read_state(client: &reqwest::Client, token: &str, entity: &str) -> Option<String> {
+    let url = format!("http://supervisor/core/api/states/{entity}");
+    let resp = client.get(&url).bearer_auth(token).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: serde_json::Value = resp.json().await.ok()?;
+    v.get("state").and_then(|s| s.as_str()).map(|s| s.to_string())
+}
+
+/// Poll the kiln entity and auto-advance burnout stages on firing transitions.
+/// On kiln-on: orders in "Invested" -> "Burnout". On kiln-off: "Burnout" ->
+/// "Finishing". `prev_firing` carries the last observed firing state across
+/// calls; the first observation only records state (no advance). No-op without
+/// the Supervisor or when KILN_ENTITY is blank.
+pub async fn kiln_poll(prev_firing: &mut Option<bool>) {
+    let Some((token, client)) = supervisor() else {
+        return;
+    };
+    let entity = std::env::var("KILN_ENTITY").unwrap_or_else(|_| "sensor.kiln_mode".to_string());
+    if entity.trim().is_empty() {
+        return;
+    }
+    let firing_states = std::env::var("KILN_FIRING_STATE").unwrap_or_else(|_| "firing".to_string());
+    let active: Vec<String> = firing_states
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let Some(state) = read_state(&client, &token, &entity).await else {
+        return;
+    };
+    let sl = state.to_lowercase();
+    let firing = active.iter().any(|a| sl.contains(a));
+
+    match (*prev_firing, firing) {
+        (Some(false), true) => {
+            if let Ok(n) = crate::db::advance_stage("Invested", "Burnout").await {
+                if n > 0 {
+                    crate::log::app_log("INFO", format!("Kiln firing: {n} order(s) Invested -> Burnout"));
+                }
+            }
+        }
+        (Some(true), false) => {
+            if let Ok(n) = crate::db::advance_stage("Burnout", "Finishing").await {
+                if n > 0 {
+                    crate::log::app_log("INFO", format!("Kiln off: {n} order(s) Burnout -> Finishing"));
+                }
+            }
+        }
+        _ => {}
+    }
+    *prev_firing = Some(firing);
+}
+
 /// Push order sensors to HA and fire `ordertracker_new_order` for orders not yet
 /// announced. No-op when not running under the Supervisor.
 pub async fn push_orders(orders: &[Order]) {
@@ -71,6 +128,8 @@ pub async fn push_orders(orders: &[Order]) {
                 "due": o.due_date.format("%Y-%m-%d").to_string(),
                 "days_left": o.days_until_due(),
                 "total": o.total_price,
+                "stage": o.stage.clone().unwrap_or_default(),
+                "notes": o.notes.clone().unwrap_or_default(),
                 "items": o.items.iter().map(|i| i.name.clone()).collect::<Vec<_>>(),
             })
         })

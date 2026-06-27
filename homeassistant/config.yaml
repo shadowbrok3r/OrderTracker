@@ -1,6 +1,6 @@
 name: "Order Tracker"
 description: "Shopify & Etsy order tracking dashboard with SurrealDB cost lookups"
-version: "0.1.26"
+version: "0.1.27"
 image: "ghcr.io/shadowbrok3r/ordertracker-{arch}"
 slug: "order_tracker"
 init: false
@@ -25,6 +25,8 @@ options:
   ETSY_KEYSTRING: ""
   ETSY_SECRET: ""
   ETSY_SHOP_ID: ""
+  KILN_ENTITY: "sensor.kiln_mode"
+  KILN_FIRING_STATE: "firing"
 schema:
   SURREAL_URL: "str?"
   SURREAL_USER: "str?"
@@ -34,5 +36,7 @@ schema:
   ETSY_KEYSTRING: "str?"
   ETSY_SECRET: "str?"
   ETSY_SHOP_ID: "str?"
+  KILN_ENTITY: "str?"
+  KILN_FIRING_STATE: "str?"
 map:
   - type: data

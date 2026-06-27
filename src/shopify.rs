@@ -236,12 +236,30 @@ pub async fn fetch_shopify_orders() -> Result<Vec<Order>, String> {
                 .line_items
                 .into_iter()
                 .map(|li| {
-                    let full_name = format!(
-                        "{} {}",
-                        li.name,
-                        li.variant_title.clone().unwrap_or_default()
-                    );
-                    let metal_type = MetalType::from_string(&full_name);
+                    // Metal from a material/metal property first, then the
+                    // variant title, then any property, then the product name
+                    // last (so a "Sterling Silver ..." title can't override a
+                    // Bronze material selection).
+                    let metal_type = li
+                        .properties
+                        .as_ref()
+                        .and_then(|props| {
+                            props
+                                .iter()
+                                .filter(|p| {
+                                    let n = p.name.to_lowercase();
+                                    n.contains("material") || n.contains("metal")
+                                })
+                                .find_map(|p| MetalType::from_string_opt(&p.value))
+                        })
+                        .or_else(|| li.variant_title.as_deref().and_then(MetalType::from_string_opt))
+                        .or_else(|| {
+                            li.properties
+                                .as_ref()
+                                .and_then(|props| props.iter().find_map(|p| MetalType::from_string_opt(&p.value)))
+                        })
+                        .or_else(|| MetalType::from_string_opt(&li.name))
+                        .unwrap_or(MetalType::Unknown);
                     let ring_size = extract_size(&li.variant_title, &li.name, &li.properties);
                     let image_url = li.product_id.and_then(|id| image_urls.get(&id).cloned());
                     OrderItem {
@@ -281,6 +299,8 @@ pub async fn fetch_shopify_orders() -> Result<Vec<Order>, String> {
                 shipping_address,
                 archived: false,
                 completed: false,
+                notes: None,
+                stage: None,
             }
         })
         .collect();

@@ -174,6 +174,8 @@ impl CachedOrder {
             shipping_address: self.shipping_address,
             archived: false,
             completed: false,
+            notes: None,
+            stage: None,
         }
     }
 }
@@ -223,12 +225,23 @@ struct OrderStateRow {
     rid: String,
     archived: bool,
     completed: bool,
+    notes: Option<String>,
+    stage: Option<String>,
 }
 
-/// Map of state_key -> (archived, completed) from the persistent order_state table.
-pub async fn load_order_state() -> Result<std::collections::HashMap<String, (bool, bool)>, String> {
+/// Per-order overlay persisted in order_state (keyed by Order::state_key).
+#[derive(Clone, Default)]
+pub struct OrderStateData {
+    pub archived: bool,
+    pub completed: bool,
+    pub notes: Option<String>,
+    pub stage: Option<String>,
+}
+
+/// Map of state_key -> overlay from the persistent order_state table.
+pub async fn load_order_state() -> Result<std::collections::HashMap<String, OrderStateData>, String> {
     let mut res = DB
-        .query("SELECT <string>id AS rid, archived, completed FROM order_state")
+        .query("SELECT <string>id AS rid, archived ?? false AS archived, completed ?? false AS completed, notes, stage FROM order_state")
         .await
         .map_err(|e| e.to_string())?;
     let rows: Vec<OrderStateRow> = res.take(0).map_err(|e| e.to_string())?;
@@ -236,7 +249,15 @@ pub async fn load_order_state() -> Result<std::collections::HashMap<String, (boo
         .into_iter()
         .map(|r| {
             let key = r.rid.strip_prefix("order_state:").unwrap_or(&r.rid).to_string();
-            (key, (r.archived, r.completed))
+            (
+                key,
+                OrderStateData {
+                    archived: r.archived,
+                    completed: r.completed,
+                    notes: r.notes,
+                    stage: r.stage,
+                },
+            )
         })
         .collect())
 }
@@ -252,6 +273,62 @@ pub async fn set_order_state(key: &str, archived: bool, completed: bool) -> Resu
         .check()
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Set the free-text production notes for an order key (empty clears).
+pub async fn set_order_notes(key: &str, notes: &str) -> Result<(), String> {
+    let value: Option<String> = if notes.trim().is_empty() { None } else { Some(notes.to_string()) };
+    DB.query("UPSERT type::record('order_state', $key) SET notes = $n")
+        .bind(("key", key.to_string()))
+        .bind(("n", value))
+        .await
+        .map_err(|e| e.to_string())?
+        .check()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Set the production stage for an order key (empty clears).
+pub async fn set_order_stage(key: &str, stage: &str) -> Result<(), String> {
+    let value: Option<String> = if stage.trim().is_empty() { None } else { Some(stage.to_string()) };
+    DB.query("UPSERT type::record('order_state', $key) SET stage = $s")
+        .bind(("key", key.to_string()))
+        .bind(("s", value))
+        .await
+        .map_err(|e| e.to_string())?
+        .check()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// State keys currently sitting at a given production stage.
+pub async fn keys_in_stage(stage: &str) -> Result<Vec<String>, String> {
+    let mut res = DB
+        .query("SELECT VALUE <string>id FROM order_state WHERE stage = $s")
+        .bind(("s", stage.to_string()))
+        .await
+        .map_err(|e| e.to_string())?;
+    let ids: Vec<String> = res.take(0).map_err(|e| e.to_string())?;
+    Ok(ids
+        .into_iter()
+        .map(|i| i.strip_prefix("order_state:").unwrap_or(&i).to_string())
+        .collect())
+}
+
+/// Advance every order at `from` stage to `to`. Returns how many moved.
+pub async fn advance_stage(from: &str, to: &str) -> Result<usize, String> {
+    let keys = keys_in_stage(from).await?;
+    if keys.is_empty() {
+        return Ok(0);
+    }
+    DB.query("UPDATE order_state SET stage = $to WHERE stage = $from")
+        .bind(("from", from.to_string()))
+        .bind(("to", to.to_string()))
+        .await
+        .map_err(|e| e.to_string())?
+        .check()
+        .map_err(|e| e.to_string())?;
+    Ok(keys.len())
 }
 
 #[derive(SurrealValue)]
@@ -311,9 +388,11 @@ pub async fn merge_orders(mut base: Vec<Order>) -> Vec<Order> {
     }
     if let Ok(state) = load_order_state().await {
         for o in base.iter_mut() {
-            if let Some(&(archived, completed)) = state.get(&o.state_key()) {
-                o.archived = archived;
-                o.completed = completed;
+            if let Some(s) = state.get(&o.state_key()) {
+                o.archived = s.archived;
+                o.completed = s.completed;
+                o.notes = s.notes.clone();
+                o.stage = s.stage.clone();
             }
         }
     }

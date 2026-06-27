@@ -392,7 +392,19 @@ pub async fn fetch_etsy_orders() -> Result<Vec<Order>, String> {
                         Some(variant_parts.join(", "))
                     };
                     let full_name = format!("{} {}", &title, variant_info.as_deref().unwrap_or(""));
-                    let metal_type = MetalType::from_string(&full_name);
+                    // Metal from the material/metal variation first, then any
+                    // variation, then the title last (titles like "Sterling
+                    // Silver Skull Ring" otherwise mask a Bronze material).
+                    let metal_type = variant_parts
+                        .iter()
+                        .filter(|s| {
+                            let l = s.to_lowercase();
+                            l.contains("material") || l.contains("metal")
+                        })
+                        .find_map(|s| MetalType::from_string_opt(s))
+                        .or_else(|| variant_parts.iter().find_map(|s| MetalType::from_string_opt(s)))
+                        .or_else(|| MetalType::from_string_opt(&title))
+                        .unwrap_or(MetalType::Unknown);
                     let ring_size = variant_parts
                         .iter()
                         .filter(|s| {
@@ -460,6 +472,8 @@ pub async fn fetch_etsy_orders() -> Result<Vec<Order>, String> {
                 shipping_address,
                 archived: false,
                 completed: false,
+                notes: None,
+                stage: None,
             })
         })
         .collect();
