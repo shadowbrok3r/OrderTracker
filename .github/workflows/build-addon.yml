@@ -1,0 +1,70 @@
+name: Build add-on image
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'src/**'
+      - 'assets/**'
+      - 'jewelry_shared/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Dioxus.toml'
+      - 'homeassistant/**'
+      - '.github/workflows/build-addon.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read add-on version
+        id: meta
+        run: |
+          version="$(sed -nE 's/^version:[[:space:]]*"?([^"#]+)"?.*/\1/p' homeassistant/config.yaml | tr -d '[:space:]')"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "ordertracker-${{ matrix.arch }}:${version}"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: homeassistant
+          file: homeassistant/Dockerfile
+          push: true
+          provenance: false
+          tags: |
+            ghcr.io/shadowbrok3r/ordertracker-${{ matrix.arch }}:${{ steps.meta.outputs.version }}
+            ghcr.io/shadowbrok3r/ordertracker-${{ matrix.arch }}:latest
+          build-args: |
+            BUILD_VERSION=${{ steps.meta.outputs.version }}-${{ github.sha }}
+            BUILD_ARCH=${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/shadowbrok3r/OrderTracker
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+          cache-from: type=gha,scope=ordertracker-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=ordertracker-${{ matrix.arch }}
