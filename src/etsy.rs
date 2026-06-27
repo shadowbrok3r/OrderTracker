@@ -395,10 +395,25 @@ pub async fn fetch_etsy_orders() -> Result<Vec<Order>, String> {
                     let metal_type = MetalType::from_string(&full_name);
                     let ring_size = variant_parts
                         .iter()
-                        .find(|s| {
-                            s.to_lowercase().contains("ring") || s.to_lowercase().contains("size")
+                        .filter(|s| {
+                            let l = s.to_lowercase();
+                            l.contains("ring") || l.contains("size")
                         })
-                        .and_then(|s| crate::model::format_ring_size(s));
+                        .find_map(|s| crate::model::format_ring_size(s))
+                        .or_else(|| {
+                            variant_parts
+                                .iter()
+                                .filter(|s| {
+                                    let l = s.to_lowercase();
+                                    l.contains("length")
+                                        || l.contains("inch")
+                                        || l.contains("necklace")
+                                        || l.contains("chain")
+                                        || l.contains("size")
+                                })
+                                .find_map(|s| crate::model::format_length(s))
+                        })
+                        .or_else(|| crate::model::format_length(&full_name));
 
                     let image_url = t
                         .listing_id

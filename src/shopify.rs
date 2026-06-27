@@ -86,7 +86,7 @@ struct ShopifyAddress {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn extract_ring_size(
+fn extract_size(
     variant_title: &Option<String>,
     name: &str,
     properties: &Option<Vec<ShopifyProperty>>,
@@ -117,7 +117,23 @@ fn extract_ring_size(
             }
         }
     }
-    None
+    // 4) necklace/chain length fallback
+    if let Some(props) = properties {
+        for prop in props {
+            let n = prop.name.to_lowercase();
+            if n.contains("length") || n.contains("inch") || n.contains("size") || n.contains("necklace") || n.contains("chain") {
+                if let Some(s) = crate::model::format_length(&prop.value) {
+                    return Some(s);
+                }
+            }
+        }
+    }
+    if let Some(vt) = variant_title {
+        if let Some(s) = crate::model::format_length(vt) {
+            return Some(s);
+        }
+    }
+    crate::model::format_length(name)
 }
 
 /// Fetch the primary image URL for each product id.
@@ -226,7 +242,7 @@ pub async fn fetch_shopify_orders() -> Result<Vec<Order>, String> {
                         li.variant_title.clone().unwrap_or_default()
                     );
                     let metal_type = MetalType::from_string(&full_name);
-                    let ring_size = extract_ring_size(&li.variant_title, &li.name, &li.properties);
+                    let ring_size = extract_size(&li.variant_title, &li.name, &li.properties);
                     let image_url = li.product_id.and_then(|id| image_urls.get(&id).cloned());
                     OrderItem {
                         name: li.name,

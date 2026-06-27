@@ -129,6 +129,8 @@ h1, h2, h3, h4, h5, h6 {
 .text-warning-red { color: var(--danger); }
 .text-comet-gold { color: var(--gold); }
 .text-supernova-orange { color: var(--crit); }
+.text-silver { color: #dbe2ee; }
+.text-bronze { color: #e6a256; }
 
 /* Cards */
 .card-cosmic {
@@ -436,6 +438,14 @@ select option { background-color: var(--surface); }
 }
 .draft-line-remove:hover { background: rgba(248, 113, 113, 0.22); }
 .draft-line-name { font-weight: 600; color: var(--text); display: flex; align-items: center; gap: 0.4rem; }
+
+/* Link an unmatched order item to a catalog piece */
+.link-row {
+  display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;
+  margin-top: 0.5rem; padding-top: 0.5rem;
+  border-top: 1px dashed var(--hairline-2);
+}
+.link-select { width: auto; min-width: 11rem; }
 
 /* Log lines */
 .log-line { padding: 0.15rem 0; border-bottom: 1px solid rgba(139, 92, 246, 0.06); }

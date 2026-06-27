@@ -917,6 +917,19 @@ fn App() -> Element {
                                             }
                                         });
                                     }
+                                },
+                                on_link: move |(piece, key): (String, String)| {
+                                    spawn(async move {
+                                        match api::link_product(piece.clone(), key.clone()).await {
+                                            Ok(()) => {
+                                                log::app_log("INFO", format!("Linked \"{}\" to catalog \"{}\"", key, piece));
+                                                if let Ok(rows) = api::fetch_catalog().await {
+                                                    catalog.set(rows);
+                                                }
+                                            }
+                                            Err(e) => log::app_log("ERROR", format!("Link product: {}", e)),
+                                        }
+                                    });
                                 }
                             }
                         }
@@ -1320,12 +1333,14 @@ fn CatalogPieceCard(piece: CatalogPiece) -> Element {
 
 #[component]
 fn CatalogRow(size: PieceCostSize) -> Element {
-    let fmt = |v: Option<f64>| v.map(|x| format!("{:.2}", x)).unwrap_or_else(|| "\u{2014}".to_string());
+    let unit = |v: Option<f64>, u: &str| {
+        v.map(|x| format!("{:.2} {}", x, u)).unwrap_or_else(|| "\u{2014}".to_string())
+    };
     let money = |v: Option<f64>| v.map(|x| format!("$ {:.2}", x)).unwrap_or_else(|| "\u{2014}".to_string());
     let ring = size.ring_size.clone().unwrap_or_default();
     let (vol, ag_g, ag, au, bz, wax) = (
-        fmt(size.volume_cm3),
-        fmt(size.silver_g),
+        unit(size.volume_cm3, "cm\u{00b3}"),
+        unit(size.silver_g, "g"),
         money(size.silver_usd),
         money(size.gold_usd),
         money(size.bronze_usd),
@@ -1336,9 +1351,9 @@ fn CatalogRow(size: PieceCostSize) -> Element {
             td { class: "td-nowrap font-mono text-aurora-purple", "{ring}" }
             td { class: "td-nowrap text-stardust", "{vol}" }
             td { class: "td-nowrap text-stardust", "{ag_g}" }
-            td { class: "td-nowrap text-star-white", "{ag}" }
-            td { class: "td-nowrap text-stardust", "{au}" }
-            td { class: "td-nowrap text-stardust", "{bz}" }
+            td { class: "td-nowrap font-semibold text-silver", "{ag}" }
+            td { class: "td-nowrap font-semibold text-comet-gold", "{au}" }
+            td { class: "td-nowrap font-semibold text-bronze", "{bz}" }
             td { class: "td-nowrap text-stardust", "{wax}" }
         }
     }
@@ -1514,6 +1529,7 @@ fn OrderDetailDialog(
     on_close: EventHandler<MouseEvent>,
     on_set_state: EventHandler<(String, bool, bool)>,
     on_set_charge: EventHandler<(String, f64)>,
+    on_link: EventHandler<(String, String)>,
 ) -> Element {
     let source_label = match order.source {
         OrderSource::Shopify => "Shopify",
@@ -1546,6 +1562,12 @@ fn OrderDetailDialog(
             String::new()
         }
     });
+
+    let catalog_names: Vec<String> = {
+        let mut n: Vec<String> = catalog.iter().map(|p| p.name.clone()).collect();
+        n.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+        n
+    };
 
     let order_cost: f64 = order
         .items
@@ -1654,6 +1676,8 @@ fn OrderDetailDialog(
                         OrderDetailItemRow {
                             item: item.clone(),
                             cost_weight: lookup_piece_cost(item, &catalog),
+                            catalog_names: catalog_names.clone(),
+                            on_link,
                         }
                     }
                 }
@@ -1663,7 +1687,13 @@ fn OrderDetailDialog(
 }
 
 #[component]
-fn OrderDetailItemRow(item: OrderItem, cost_weight: Option<ItemCostWeight>) -> Element {
+fn OrderDetailItemRow(
+    item: OrderItem,
+    cost_weight: Option<ItemCostWeight>,
+    catalog_names: Vec<String>,
+    on_link: EventHandler<(String, String)>,
+) -> Element {
+    let mut pick = use_signal(String::new);
     let price_str = format!("${:.2}", item.price);
     let (cost_str, weight_str) = match &cost_weight {
         Some(cw) => (
@@ -1679,6 +1709,8 @@ fn OrderDetailItemRow(item: OrderItem, cost_weight: Option<ItemCostWeight>) -> E
         }
         None => "\u{2014}".to_string(),
     };
+    let unresolved = cost_weight.is_none() && !catalog_names.is_empty();
+    let item_name = item.name.clone();
     rsx! {
         div { class: "flex items-start gap-3 p-3 rounded-lg bg-nebula-dark/50 border border-nebula-purple/20",
             {item.image_url.as_ref().map(|url| rsx! {
@@ -1695,6 +1727,29 @@ fn OrderDetailItemRow(item: OrderItem, cost_weight: Option<ItemCostWeight>) -> E
                 p { class: "text-stardust text-sm mt-1",
                     "Our cost: {cost_str} | Margin: {margin_str} | Weight: {weight_str}"
                 }
+                {unresolved.then(|| rsx! {
+                    div { class: "link-row",
+                        span { class: "text-stardust text-xs", "Not in catalog \u{2014} link to:" }
+                        select {
+                            class: "link-select",
+                            onchange: move |e| pick.set(e.value()),
+                            option { value: "", "Choose piece..." }
+                            for nm in catalog_names.iter() {
+                                option { value: "{nm}", "{nm}" }
+                            }
+                        }
+                        button {
+                            class: "btn-cosmic text-sm", r#type: "button",
+                            onclick: move |_| {
+                                let p = pick.read().clone();
+                                if !p.is_empty() {
+                                    on_link.call((p, item_name.clone()));
+                                }
+                            },
+                            "Link"
+                        }
+                    }
+                })}
             }
         }
     }

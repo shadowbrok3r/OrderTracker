@@ -439,6 +439,19 @@ pub async fn cache_thumbnail(client: &reqwest::Client, url: &str) -> Option<Stri
     Some(format!("thumb/{}", key))
 }
 
+/// Add a product key (an Etsy/Shopify item name) to a catalog jewelry piece so
+/// its orders resolve to that piece's costs. Matches the piece by display name.
+pub async fn link_product(piece_name: &str, product_key: &str) -> Result<(), String> {
+    DB.query("UPDATE jewelry SET product_keys = array::union(product_keys ?? [], [$key]) WHERE name = $name")
+        .bind(("name", piece_name.to_string()))
+        .bind(("key", product_key.to_string()))
+        .await
+        .map_err(|e| e.to_string())?
+        .check()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Load the catalog: every jewelry piece with its linked piece_costs sizes.
 pub async fn load_catalog() -> Result<Vec<crate::model::CatalogPiece>, String> {
     let q = "SELECT name, kind, product_keys, \

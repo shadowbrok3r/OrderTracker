@@ -174,24 +174,125 @@ fn ring_size_key(s: &str) -> String {
     }
 }
 
-/// Extract a US ring size from a variant/property string and format it as
-/// "{n} US" (e.g. "Ring Size: 9" -> "9 US", "Silver / 9" -> "9 US"). Only a
-/// whole token that parses to 3.0..=16.0 counts, so metal karats ("14k") and
-/// chain lengths ("9 inch") are ignored.
+fn tokenize(raw: &str) -> Vec<String> {
+    raw.split(|c: char| c.is_whitespace() || matches!(c, ',' | '|' | ':'))
+        .map(|w| w.trim())
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_string())
+        .collect()
+}
+
+fn is_length_unit(s: &str) -> bool {
+    s.starts_with("in") || s.starts_with('"') || s.starts_with("cm") || s.starts_with("mm")
+}
+
+/// Extract a US ring size and format it as "{n} US". Tolerates surrounding words
+/// ("US 7", "Size 7", "Silver / 9"), half sizes ("7 1/2" -> "7.5 US"), and
+/// ignores karats ("14k") and chain lengths ("18 inch"). Only 3.0..=16.0 counts.
 pub fn format_ring_size(raw: &str) -> Option<String> {
-    fn as_us(t: &str) -> Option<String> {
-        let v: f64 = t.trim().parse().ok()?;
+    fn fmt(v: f64) -> Option<String> {
         if !(3.0..=16.0).contains(&v) {
             return None;
         }
         let n = if v.fract() == 0.0 { format!("{}", v as i64) } else { format!("{}", v) };
         Some(format!("{} US", n))
     }
-    if let Some(s) = as_us(raw) {
-        return Some(s);
+    let words = tokenize(raw);
+    for (i, w) in words.iter().enumerate() {
+        let wl = w.to_lowercase();
+        if wl.ends_with('k') || wl.ends_with("kt") {
+            continue; // karat, not a size
+        }
+        let num: String = w.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+        if num.is_empty() {
+            continue;
+        }
+        let Ok(mut v) = num.trim_matches('.').parse::<f64>() else { continue };
+        let rest = w.chars().skip_while(|c| c.is_ascii_digit() || *c == '.').collect::<String>().to_lowercase();
+        if is_length_unit(&rest) {
+            continue; // e.g. 18in, 9"
+        }
+        if let Some(next) = words.get(i + 1) {
+            match next.as_str() {
+                "1/2" => v += 0.5,
+                "1/4" => v += 0.25,
+                "3/4" => v += 0.75,
+                _ => {}
+            }
+            if is_length_unit(&next.to_lowercase()) {
+                continue; // a length, not a ring size
+            }
+        }
+        if let Some(s) = fmt(v) {
+            return Some(s);
+        }
     }
-    raw.split(|c| c == '/' || c == ',' || c == '|' || c == ':')
-        .find_map(as_us)
+    // no-space slash form, e.g. "Silver/9"
+    raw.split('/').find_map(|p| p.trim().parse::<f64>().ok().and_then(fmt))
+}
+
+/// Extract a chain/necklace length and format it as "{n} in" / "{n} cm" /
+/// "{n} mm". Requires an explicit length unit, so plain numbers and karats
+/// never count.
+pub fn format_length(raw: &str) -> Option<String> {
+    let words = tokenize(raw);
+    for (i, w) in words.iter().enumerate() {
+        let num: String = w.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+        if num.is_empty() {
+            continue;
+        }
+        let Ok(v) = num.trim_matches('.').parse::<f64>() else { continue };
+        let rest = w.chars().skip_while(|c| c.is_ascii_digit() || *c == '.').collect::<String>().to_lowercase();
+        let next = words.get(i + 1).map(|s| s.to_lowercase()).unwrap_or_default();
+        let unit = if rest.starts_with("in") || rest.starts_with('"') || next.starts_with("in") || next.starts_with('"') {
+            Some("in")
+        } else if rest.starts_with("cm") || next.starts_with("cm") {
+            Some("cm")
+        } else if rest.starts_with("mm") || next.starts_with("mm") {
+            Some("mm")
+        } else {
+            None
+        };
+        if let Some(u) = unit {
+            let n = if v.fract() == 0.0 { format!("{}", v as i64) } else { format!("{}", v) };
+            return Some(format!("{} {}", n, u));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_length, format_ring_size};
+
+    #[test]
+    fn ring_sizes() {
+        assert_eq!(format_ring_size("Ring Size: US 7").as_deref(), Some("7 US"));
+        assert_eq!(format_ring_size("Size: 7").as_deref(), Some("7 US"));
+        assert_eq!(format_ring_size("Silver / 9").as_deref(), Some("9 US"));
+        assert_eq!(format_ring_size("Silver/9").as_deref(), Some("9 US"));
+        assert_eq!(format_ring_size("13 / .925 Silver").as_deref(), Some("13 US"));
+        assert_eq!(format_ring_size("Ring Size: 7 1/2").as_deref(), Some("7.5 US"));
+        assert_eq!(format_ring_size("7.5").as_deref(), Some("7.5 US"));
+    }
+
+    #[test]
+    fn not_ring_sizes() {
+        assert_eq!(format_ring_size("14k Gold"), None);
+        assert_eq!(format_ring_size("18 inch"), None);
+        assert_eq!(format_ring_size("Metal: Silver"), None);
+        assert_eq!(format_ring_size("14k Gold Plated / 9").as_deref(), Some("9 US"));
+    }
+
+    #[test]
+    fn lengths() {
+        assert_eq!(format_length("Length: 18 inches").as_deref(), Some("18 in"));
+        assert_eq!(format_length("18\"").as_deref(), Some("18 in"));
+        assert_eq!(format_length("20in").as_deref(), Some("20 in"));
+        assert_eq!(format_length("45 cm").as_deref(), Some("45 cm"));
+        assert_eq!(format_length("Silver"), None);
+        assert_eq!(format_length("Ring Size: 9"), None);
+    }
 }
 
 fn pick_cost_weight_size(s: &PieceCostSize, metal: &MetalType) -> Option<ItemCostWeight> {

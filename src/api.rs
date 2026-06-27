@@ -140,3 +140,12 @@ pub async fn update_custom_order(order: Order) -> Result<(), ServerFnError> {
         .await
         .map_err(|e| ServerFnError::new(e))
 }
+
+/// Link an Etsy/Shopify product name to a catalog piece (adds to product_keys).
+#[server]
+pub async fn link_product(piece_name: String, product_key: String) -> Result<(), ServerFnError> {
+    crate::db::ensure_db_init().await.map_err(|e| ServerFnError::new(e))?;
+    crate::db::link_product(&piece_name, &product_key)
+        .await
+        .map_err(|e| ServerFnError::new(e))
+}
