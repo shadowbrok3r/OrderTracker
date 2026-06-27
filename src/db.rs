@@ -24,10 +24,13 @@ pub async fn ensure_db_init() -> Result<(), String> {
             if url.is_empty() {
                 return Err("SURREAL_URL is empty".to_string());
             }
-            let connect_result = if url.starts_with("wss") {
-                DB.connect::<Wss>(&url).await
+            // Typed Ws/Wss engines prepend the scheme; pass host only, not the full URL.
+            let connect_result = if let Some(host) = url.strip_prefix("wss://") {
+                DB.connect::<Wss>(host).await
+            } else if let Some(host) = url.strip_prefix("ws://") {
+                DB.connect::<Ws>(host).await
             } else {
-                DB.connect::<Ws>(&url).await
+                DB.connect::<Ws>(url.as_str()).await
             };
             match &connect_result {
                 Ok(_) => eprintln!("Connected to SurrealDB at {}", url),
