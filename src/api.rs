@@ -4,7 +4,7 @@
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Order, PieceCostRow};
+use crate::model::{CatalogPiece, Order};
 
 /// Result of fetching orders from all sources.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,13 +37,13 @@ pub async fn fetch_all_orders() -> Result<FetchOrdersResult, ServerFnError> {
     })
 }
 
-/// Load piece costs from SurrealDB (initialises the DB connection on first call).
+/// Load the jewelry catalog (pieces + linked sizes) from SurrealDB.
 #[server]
-pub async fn fetch_piece_costs() -> Result<Vec<PieceCostRow>, ServerFnError> {
+pub async fn fetch_catalog() -> Result<Vec<CatalogPiece>, ServerFnError> {
     crate::db::ensure_db_init()
         .await
         .map_err(|e| ServerFnError::new(e))?;
-    crate::db::load_piece_costs()
+    crate::db::load_catalog()
         .await
         .map_err(|e| ServerFnError::new(e))
 }

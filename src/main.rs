@@ -15,11 +15,17 @@ use dioxus::prelude::*;
 use log::{app_logs_snapshot, LogEntry};
 
 use components::dialog::{DialogContent, DialogRoot, DialogTitle};
-use model::{lookup_piece_cost, ItemCostWeight, MetalType, Order, OrderItem, OrderSource, PieceCostRow};
+use model::{lookup_piece_cost, CatalogPiece, ItemCostWeight, MetalType, Order, OrderItem, OrderSource, PieceCostSize};
 
 // ============================================================================
 // App state
 // ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MainView {
+    Orders,
+    Catalog,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 enum ViewFilter {
@@ -231,6 +237,7 @@ fn App() -> Element {
     let mut loading = use_signal(|| true);
     let mut error = use_signal(|| None::<String>);
     let mut view_filter = use_signal(|| ViewFilter::All);
+    let mut main_view = use_signal(|| MainView::Orders);
     let mut sort_by = use_signal(|| SortBy::DueDate);
     let mut search_query = use_signal(String::new);
     let mut settings_open = use_signal(|| false);
@@ -239,13 +246,13 @@ fn App() -> Element {
     let mut detail_order = use_signal(|| None::<Order>);
     let mut logs_open = use_signal(|| false);
     let mut log_snapshot = use_signal(|| Vec::<LogEntry>::new());
-    let mut piece_costs_cache = use_signal(|| Vec::<PieceCostRow>::new());
+    let mut catalog = use_signal(|| Vec::<CatalogPiece>::new());
 
     use_effect(move || {
         spawn(async move {
-            match api::fetch_piece_costs().await {
-                Ok(rows) => piece_costs_cache.set(rows),
-                Err(e) => log::app_log("INFO", format!("Piece costs load: {}", e)),
+            match api::fetch_catalog().await {
+                Ok(rows) => catalog.set(rows),
+                Err(e) => log::app_log("INFO", format!("Catalog load: {}", e)),
             }
         });
     });
@@ -347,6 +354,16 @@ fn App() -> Element {
                         }
                     }
                     div { class: "flex items-center gap-3",
+                        FilterButton {
+                            label: "Orders",
+                            active: *main_view.read() == MainView::Orders,
+                            onclick: move |_| main_view.set(MainView::Orders)
+                        }
+                        FilterButton {
+                            label: "Catalog",
+                            active: *main_view.read() == MainView::Catalog,
+                            onclick: move |_| main_view.set(MainView::Catalog)
+                        }
                         button {
                             class: "btn-cosmic",
                             onclick: move |_| {
@@ -510,7 +527,7 @@ fn App() -> Element {
                         rsx! {
                             OrderDetailDialog {
                                 order: order.clone(),
-                                piece_costs: piece_costs_cache.read().clone(),
+                                catalog: catalog.read().clone(),
                                 on_close: move |_| detail_order.set(None)
                             }
                         }
@@ -520,7 +537,7 @@ fn App() -> Element {
                 }
             }
 
-            div { class: "container px-6 py-6",
+            div { class: if *main_view.read() == MainView::Orders { "container px-6 py-6" } else { "hidden" },
                 div { class: "card-cosmic p-6 mb-6",
                     div { class: "flex flex-wrap items-center gap-4",
                         div { class: "flex-1 min-w-0",
@@ -610,7 +627,7 @@ fn App() -> Element {
                                     for (order, order_for_click) in orders_for_table.read().clone() {
                                         OrderRow {
                                             order,
-                                            piece_costs: piece_costs_cache.read().clone(),
+                                            catalog: catalog.read().clone(),
                                             on_click: move |_| detail_order.set(Some(order_for_click.clone())),
                                         }
                                     }
@@ -632,6 +649,84 @@ fn App() -> Element {
                     rsx! { }
                 }}
             }
+            div { class: if *main_view.read() == MainView::Catalog { "container px-6 py-6" } else { "hidden" },
+                CatalogView { catalog: catalog.read().clone() }
+            }
+        }
+    }
+}
+
+#[component]
+fn CatalogView(catalog: Vec<CatalogPiece>) -> Element {
+    let total_pieces = catalog.len();
+    let total_rows: usize = catalog.iter().map(|p| p.sizes.len()).sum();
+    rsx! {
+        div { class: "card-cosmic p-6 mb-6",
+            div { class: "flex items-center justify-between flex-wrap gap-3",
+                h2 { class: "text-xl font-bold text-star-white", "Catalog" }
+                span { class: "text-stardust text-sm", "{total_pieces} pieces \u{00b7} {total_rows} cost rows" }
+            }
+        }
+        if catalog.is_empty() {
+            div { class: "card-cosmic p-8 text-center",
+                p { class: "text-stardust", "Catalog is empty. Publish from the cost calculator." }
+            }
+        } else {
+            div { class: "card-cosmic overflow-hidden",
+                div { class: "overflow-x-auto",
+                    table { class: "table-cosmic table-orders",
+                        thead {
+                            tr {
+                                th { "Piece" }
+                                th { "Type" }
+                                th { "Size" }
+                                th { title: "Volume (cm\u{00b3})", "Vol" }
+                                th { title: "Silver weight (g)", "Ag g" }
+                                th { title: "Silver cost", "Ag $" }
+                                th { title: "14K gold cost", "Au $" }
+                                th { title: "Bronze cost", "Bz $" }
+                                th { title: "Wax cost", "Wax $" }
+                            }
+                        }
+                        tbody {
+                            for piece in catalog.iter() {
+                                for s in piece.sizes.iter() {
+                                    CatalogRow { name: piece.name.clone(), kind: piece.kind.clone(), size: s.clone() }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn CatalogRow(name: String, kind: String, size: PieceCostSize) -> Element {
+    let fmt = |v: Option<f64>| v.map(|x| format!("{:.2}", x)).unwrap_or_else(|| "\u{2014}".to_string());
+    let money = |v: Option<f64>| v.map(|x| format!("$ {:.2}", x)).unwrap_or_else(|| "\u{2014}".to_string());
+    let ring = size.ring_size.clone().unwrap_or_default();
+    let kind_class = if kind == "ring" { "badge badge-nebula" } else { "badge badge-method" };
+    let (vol, ag_g, ag, au, bz, wax) = (
+        fmt(size.volume_cm3),
+        fmt(size.silver_g),
+        money(size.silver_usd),
+        money(size.gold_usd),
+        money(size.bronze_usd),
+        money(size.wax_usd),
+    );
+    rsx! {
+        tr {
+            td { class: "td-nowrap font-semibold text-star-white", "{name}" }
+            td { class: "td-nowrap", span { class: "{kind_class}", "{kind}" } }
+            td { class: "td-nowrap font-mono text-aurora-purple", "{ring}" }
+            td { class: "td-nowrap text-stardust", "{vol}" }
+            td { class: "td-nowrap text-stardust", "{ag_g}" }
+            td { class: "td-nowrap text-star-white", "{ag}" }
+            td { class: "td-nowrap text-stardust", "{au}" }
+            td { class: "td-nowrap text-stardust", "{bz}" }
+            td { class: "td-nowrap text-stardust", "{wax}" }
         }
     }
 }
@@ -651,7 +746,7 @@ fn FilterButton(label: String, active: bool, onclick: EventHandler<MouseEvent>) 
 #[component]
 fn OrderRow(
     order: Order,
-    piece_costs: Vec<PieceCostRow>,
+    catalog: Vec<CatalogPiece>,
     on_click: EventHandler<MouseEvent>,
 ) -> Element {
     let days_left = order.days_until_due();
@@ -694,7 +789,7 @@ fn OrderRow(
     let first_image = order.items.first().and_then(|i| i.image_url.clone());
 
     let (order_cost, order_weight) = order.items.iter().fold((0.0_f64, 0.0_f64), |(c, w), item| {
-        let cw = lookup_piece_cost(item, &piece_costs);
+        let cw = lookup_piece_cost(item, &catalog);
         let q = item.quantity as f64;
         (
             c + cw.as_ref().map(|x| x.cost_usd * q).unwrap_or(0.0),
@@ -801,7 +896,7 @@ fn OrderRow(
 #[component]
 fn OrderDetailDialog(
     order: Order,
-    piece_costs: Vec<PieceCostRow>,
+    catalog: Vec<CatalogPiece>,
     on_close: EventHandler<MouseEvent>,
 ) -> Element {
     let source_label = match order.source {
@@ -857,7 +952,7 @@ fn OrderDetailDialog(
         {{
             let order_cost: f64 = order.items.iter()
                 .map(|item| {
-                    let cw = lookup_piece_cost(item, &piece_costs);
+                    let cw = lookup_piece_cost(item, &catalog);
                     (item.quantity as f64) * cw.as_ref().map(|x| x.cost_usd).unwrap_or(0.0)
                 })
                 .sum();
@@ -889,7 +984,7 @@ fn OrderDetailDialog(
                 for item in order.items.iter() {
                     OrderDetailItemRow {
                         item: item.clone(),
-                        cost_weight: lookup_piece_cost(item, &piece_costs),
+                        cost_weight: lookup_piece_cost(item, &catalog),
                     }
                 }
             }

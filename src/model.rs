@@ -3,7 +3,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-pub use jewelry_shared::PieceCostRow;
+pub use jewelry_shared::{CatalogPiece, PieceCostRow, PieceCostSize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MetalType {
@@ -111,39 +111,29 @@ pub struct ItemCostWeight {
     pub weight_g: f64,
 }
 
-/// Match an order item to a piece_costs row and return cost/weight for the item's metal type.
-pub fn lookup_piece_cost(item: &OrderItem, piece_costs: &[PieceCostRow]) -> Option<ItemCostWeight> {
-    let item_name_normalized = item.name.to_lowercase().trim().to_string();
+/// Match an order item to a catalog piece + size, returning cost/weight for the item's metal.
+pub fn lookup_piece_cost(item: &OrderItem, catalog: &[CatalogPiece]) -> Option<ItemCostWeight> {
+    let item_name = item.name.to_lowercase();
+    let item_compact: String = item_name.chars().filter(|c| c.is_alphanumeric()).collect();
     let item_ring = item.ring_size.as_ref().map(|s| s.trim().to_string());
 
-    // 1) Try match by product_keys
-    for row in piece_costs {
-        if let Some(keys) = &row.product_keys {
+    let piece = catalog.iter().find(|p| {
+        if let Some(keys) = &p.product_keys {
             if keys.iter().any(|k| {
-                k.trim().to_lowercase() == item_name_normalized
-                    || item.name.to_lowercase().contains(&k.trim().to_lowercase())
+                let kl = k.trim().to_lowercase();
+                !kl.is_empty() && (kl == item_name || item_name.contains(&kl))
             }) {
-                if ring_matches(&row.ring_size, &item_ring) {
-                    return pick_cost_weight(row, &item.metal_type);
-                }
+                return true;
             }
         }
-    }
+        let name_compact: String =
+            p.name.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect();
+        !name_compact.is_empty()
+            && (item_compact.contains(&name_compact) || name_compact.contains(&item_compact))
+    })?;
 
-    // 2) Try match by design_key (normalized item name or contains)
-    for row in piece_costs {
-        let design_lower = row.design_key.to_lowercase();
-        if design_lower == item_name_normalized
-            || item_name_normalized.contains(&design_lower)
-            || design_lower.contains(&item_name_normalized)
-        {
-            if ring_matches(&row.ring_size, &item_ring) {
-                return pick_cost_weight(row, &item.metal_type);
-            }
-        }
-    }
-
-    None
+    let size = piece.sizes.iter().find(|s| ring_matches(&s.ring_size, &item_ring))?;
+    pick_cost_weight_size(size, &item.metal_type)
 }
 
 fn ring_matches(row_ring: &Option<String>, item_ring: &Option<String>) -> bool {
@@ -169,33 +159,16 @@ fn ring_size_key(s: &str) -> String {
     }
 }
 
-fn pick_cost_weight(row: &PieceCostRow, metal: &MetalType) -> Option<ItemCostWeight> {
+fn pick_cost_weight_size(s: &PieceCostSize, metal: &MetalType) -> Option<ItemCostWeight> {
     let (cost, weight) = match metal {
-        MetalType::Silver => (
-            row.silver_usd.unwrap_or(0.0),
-            row.silver_g.unwrap_or(0.0),
-        ),
+        MetalType::Silver => (s.silver_usd.unwrap_or(0.0), s.silver_g.unwrap_or(0.0)),
         // "Gold Plated" pieces are cast in silver then plated, so cost from the silver base.
-        MetalType::Gold => (row.silver_usd.unwrap_or(0.0), row.silver_g.unwrap_or(0.0)),
-        MetalType::Bronze => (
-            row.bronze_usd.unwrap_or(0.0),
-            row.bronze_g.unwrap_or(0.0),
-        ),
-        MetalType::Unknown => {
-            let c = row.silver_usd.unwrap_or(0.0)
-                + row.gold_usd.unwrap_or(0.0)
-                + row.bronze_usd.unwrap_or(0.0);
-            let w = row.silver_g.unwrap_or(0.0)
-                + row.gold_g.unwrap_or(0.0)
-                + row.bronze_g.unwrap_or(0.0);
-            (c, w)
-        }
+        MetalType::Gold => (s.silver_usd.unwrap_or(0.0), s.silver_g.unwrap_or(0.0)),
+        MetalType::Bronze => (s.bronze_usd.unwrap_or(0.0), s.bronze_g.unwrap_or(0.0)),
+        MetalType::Unknown => (s.silver_usd.unwrap_or(0.0), s.silver_g.unwrap_or(0.0)),
     };
     if cost > 0.0 || weight > 0.0 {
-        Some(ItemCostWeight {
-            cost_usd: cost,
-            weight_g: weight,
-        })
+        Some(ItemCostWeight { cost_usd: cost, weight_g: weight })
     } else {
         None
     }

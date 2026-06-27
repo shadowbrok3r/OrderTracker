@@ -1,6 +1,6 @@
 name: "Order Tracker"
 description: "Shopify & Etsy order tracking dashboard with SurrealDB cost lookups"
-version: "0.1.14"
+version: "0.1.15"
 image: "ghcr.io/shadowbrok3r/ordertracker-{arch}"
 slug: "order_tracker"
 init: false

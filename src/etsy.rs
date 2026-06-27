@@ -10,6 +10,9 @@ use crate::model::{MetalType, Order, OrderItem, OrderSource};
 fn etsy_keystring() -> String {
     std::env::var("ETSY_KEYSTRING").unwrap_or_default()
 }
+fn etsy_secret() -> String {
+    std::env::var("ETSY_SECRET").unwrap_or_default()
+}
 fn etsy_shop_id() -> String {
     std::env::var("ETSY_SHOP_ID").unwrap_or_default()
 }
@@ -228,7 +231,8 @@ pub async fn fetch_etsy_orders() -> Result<Vec<Order>, String> {
         "https://api.etsy.com/v3/application/shops/{}/receipts",
         etsy_shop_id()
     );
-    let x_api_key = etsy_keystring();
+    // Etsy (since 2026-02-09) requires keystring:shared_secret in x-api-key.
+    let x_api_key = format!("{}:{}", etsy_keystring(), etsy_secret());
 
     let mut all_receipts = Vec::new();
     let mut offset = 0i32;

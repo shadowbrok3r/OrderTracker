@@ -53,11 +53,13 @@ pub async fn ensure_db_init() -> Result<(), String> {
         .map(|_| ())
 }
 
-/// Load all piece_costs from the database (call after ensure_db_init()).
-pub async fn load_piece_costs() -> Result<Vec<crate::model::PieceCostRow>, String> {
-    let rows: Vec<crate::model::PieceCostRow> = DB
-        .select("piece_costs")
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(rows)
+/// Load the catalog: every jewelry piece with its linked piece_costs sizes.
+pub async fn load_catalog() -> Result<Vec<crate::model::CatalogPiece>, String> {
+    let q = "SELECT name, kind, product_keys, \
+        (SELECT ring_size, volume_cm3, silver_g, silver_usd, gold_g, gold_usd, bronze_g, bronze_usd, wax_usd \
+         FROM piece_costs WHERE design_key = $parent.id) AS sizes \
+        FROM jewelry ORDER BY name";
+    let mut res = DB.query(q).await.map_err(|e| e.to_string())?;
+    let pieces: Vec<crate::model::CatalogPiece> = res.take(0).map_err(|e| e.to_string())?;
+    Ok(pieces)
 }
