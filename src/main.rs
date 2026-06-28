@@ -28,6 +28,7 @@ use model::{lookup_piece_cost, CatalogPiece, ItemCostWeight, MetalType, Order, O
 enum MainView {
     Orders,
     Catalog,
+    Listings,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -545,6 +546,11 @@ fn App() -> Element {
                             label: "Catalog",
                             active: *main_view.read() == MainView::Catalog,
                             onclick: move |_| main_view.set(MainView::Catalog)
+                        }
+                        FilterButton {
+                            label: "Listings",
+                            active: *main_view.read() == MainView::Listings,
+                            onclick: move |_| main_view.set(MainView::Listings)
                         }
                         button {
                             class: "btn-nebula",
@@ -1110,6 +1116,9 @@ fn App() -> Element {
             div { class: if *main_view.read() == MainView::Catalog { "container px-6 py-6" } else { "hidden" },
                 CatalogView { catalog: catalog.read().clone() }
             }
+            div { class: if *main_view.read() == MainView::Listings { "container px-6 py-6" } else { "hidden" },
+                ListingsView { catalog }
+            }
         }
     }
 }
@@ -1153,6 +1162,59 @@ fn find_thumb(orders: &[Order], name: &str, size: &Option<String>) -> Option<Str
         }
     }
     fallback
+}
+
+const STOP_WORDS: &[&str] = &[
+    "the", "and", "for", "with", "ring", "rings", "pendant", "necklace", "charm", "chain",
+    "silver", "sterling", "925", "gold", "vermeil", "plated", "bronze", "brass", "handmade",
+    "mens", "womens", "men", "women", "size", "sized", "inch", "custom", "jewelry",
+];
+
+fn name_tokens(s: &str) -> Vec<String> {
+    s.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 3 && !STOP_WORDS.contains(w))
+        .map(|w| w.to_string())
+        .collect()
+}
+
+/// (already-linked piece, suggested piece) for a listing title vs the catalog.
+/// Linked = a piece whose product_keys already cover this title. Suggested = the
+/// best name match above a threshold.
+fn match_listing(title: &str, catalog: &[CatalogPiece]) -> (Option<String>, Option<String>) {
+    let lc = compact(title);
+    if lc.is_empty() {
+        return (None, None);
+    }
+    for p in catalog {
+        if let Some(keys) = &p.product_keys {
+            for k in keys {
+                let kc = compact(k);
+                if !kc.is_empty() && (kc == lc || lc.contains(&kc)) {
+                    return (Some(p.name.clone()), None);
+                }
+            }
+        }
+    }
+    let lt = name_tokens(title);
+    let mut best: Option<(String, f64)> = None;
+    for p in catalog {
+        let pc = compact(&p.name);
+        if pc.is_empty() {
+            continue;
+        }
+        let mut score = 0.0;
+        if lc.contains(&pc) || pc.contains(&lc) {
+            score += 100.0 + pc.len().min(lc.len()) as f64;
+        }
+        let pt = name_tokens(&p.name);
+        let inter = lt.iter().filter(|w| pt.contains(w)).count();
+        score += 15.0 * inter as f64;
+        if score > 0.0 && best.as_ref().map_or(true, |(_, b)| score > *b) {
+            best = Some((p.name.clone(), score));
+        }
+    }
+    (None, best.filter(|(_, s)| *s >= 20.0).map(|(n, _)| n))
 }
 
 /// Cheapest silver cost across a piece's sizes (representative for sorting).
@@ -1350,13 +1412,34 @@ fn CatalogPieceCard(piece: CatalogPiece) -> Element {
             format!("Ag $ {:.0}\u{2013}{:.0}", lo, hi)
         }
     };
+    let min_silver = piece_min_silver(&piece);
+    let (sale_str, margin_str, margin_class) = match piece.sale_price {
+        Some(sale) if sale > 0.0 => {
+            let s = format!("Sale $ {:.0}", sale);
+            match min_silver {
+                Some(cost) => {
+                    let m = sale - cost;
+                    let cls = if m < 0.0 { "text-warning-red text-sm font-semibold" } else { "text-alien-green text-sm font-semibold" };
+                    (s, format!("Margin $ {:.0}", m), cls)
+                }
+                None => (s, String::new(), "text-stardust text-sm"),
+            }
+        }
+        _ => (String::new(), String::new(), "text-stardust text-sm"),
+    };
     rsx! {
         details { class: "catalog-piece",
             summary { class: "catalog-summary",
+                {match piece.thumbnail.as_deref() {
+                    Some(url) => rsx! { img { class: "order-thumb", src: "{url}", alt: "" } },
+                    None => rsx! { span { class: "order-thumb-placeholder", "pkg" } },
+                }}
                 span { class: "font-semibold text-star-white", "{piece.name}" }
                 span { class: "{kind_class}", "{piece.kind}" }
                 span { class: "text-stardust text-sm", "{n} sizes" }
                 span { class: "text-stardust text-sm catalog-range", "{range}" }
+                {(!sale_str.is_empty()).then(|| rsx! { span { class: "text-comet-gold text-sm", "{sale_str}" } })}
+                {(!margin_str.is_empty()).then(|| rsx! { span { class: "{margin_class}", "{margin_str}" } })}
             }
             div { class: "overflow-x-auto",
                 table { class: "table-cosmic table-orders",
@@ -1406,6 +1489,227 @@ fn CatalogRow(size: PieceCostSize) -> Element {
             td { class: "td-nowrap font-semibold text-comet-gold", "{au}" }
             td { class: "td-nowrap font-semibold text-bronze", "{bz}" }
             td { class: "td-nowrap text-stardust", "{wax}" }
+        }
+    }
+}
+
+#[component]
+fn ListingsView(catalog: Signal<Vec<CatalogPiece>>) -> Element {
+    let mut listings = use_signal(Vec::<model::Listing>::new);
+    let mut pulling = use_signal(|| false);
+    let mut errors = use_signal(Vec::<String>::new);
+    let mut pulled = use_signal(|| false);
+    let mut search = use_signal(String::new);
+    let mut source_filter = use_signal(|| "all".to_string());
+    let mut unlinked_only = use_signal(|| true);
+
+    let catalog_names = {
+        let mut n: Vec<String> = catalog.read().iter().map(|p| p.name.clone()).collect();
+        n.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+        n
+    };
+
+    let matches = use_memo(move || {
+        let cat = catalog.read();
+        let mut m = std::collections::HashMap::<String, (Option<String>, Option<String>)>::new();
+        for l in listings.read().iter() {
+            m.insert(format!("{}:{}", l.source, l.id), match_listing(&l.title, &cat));
+        }
+        m
+    });
+
+    let total = listings.read().len();
+    let linked_count = matches.read().values().filter(|(linked, _)| linked.is_some()).count();
+
+    rsx! {
+        div { class: "card-cosmic p-6 mb-6",
+            div { class: "flex items-center justify-between flex-wrap gap-3 mb-4",
+                h2 { class: "text-xl font-bold text-star-white", "Listings" }
+                span { class: "text-stardust text-sm", "{linked_count} linked \u{00b7} {total} pulled" }
+            }
+            div { class: "flex flex-wrap items-center gap-4",
+                div { class: "flex-1 min-w-0",
+                    input {
+                        r#type: "search", class: "w-full", placeholder: "Search listings...",
+                        value: "{search}", oninput: move |e| search.set(e.value())
+                    }
+                }
+                div { class: "flex gap-2",
+                    FilterButton { label: "All", active: *source_filter.read() == "all", onclick: move |_| source_filter.set("all".to_string()) }
+                    FilterButton { label: "Shopify", active: *source_filter.read() == "shopify", onclick: move |_| source_filter.set("shopify".to_string()) }
+                    FilterButton { label: "Etsy", active: *source_filter.read() == "etsy", onclick: move |_| source_filter.set("etsy".to_string()) }
+                    FilterButton { label: "Unlinked only", active: *unlinked_only.read(), onclick: move |_| { let v = *unlinked_only.read(); unlinked_only.set(!v); } }
+                }
+                button {
+                    class: "btn-nebula", disabled: *pulling.read(),
+                    onclick: move |_| {
+                        pulling.set(true);
+                        errors.set(Vec::new());
+                        spawn(async move {
+                            log::app_log("INFO", "Pulling Shopify + Etsy listings...");
+                            match api::fetch_listings().await {
+                                Ok(result) => {
+                                    log::app_log("INFO", format!("Pulled {} listings.", result.listings.len()));
+                                    for e in &result.errors { log::app_log("ERROR", e.clone()); }
+                                    errors.set(result.errors);
+                                    listings.set(result.listings);
+                                    pulled.set(true);
+                                }
+                                Err(e) => errors.set(vec![e.to_string()]),
+                            }
+                            pulling.set(false);
+                        });
+                    },
+                    {if *pulling.read() { "Pulling..." } else { "Pull listings" }}
+                }
+            }
+        }
+        {if !errors.read().is_empty() {
+            rsx! {
+                div { class: "card-cosmic p-4 mb-6 border-warning-red",
+                    for e in errors.read().iter() {
+                        p { class: "text-warning-red text-sm", "{e}" }
+                    }
+                }
+            }
+        } else { rsx! {} }}
+        {
+            let q = search.read().to_lowercase();
+            let sf = source_filter.read().clone();
+            let uo = *unlinked_only.read();
+            let m = matches.read();
+            let rows: Vec<(model::Listing, Option<String>, Option<String>)> = listings
+                .read()
+                .iter()
+                .filter(|l| sf == "all" || l.source == sf)
+                .filter(|l| q.is_empty() || l.title.to_lowercase().contains(&q))
+                .filter_map(|l| {
+                    let (linked, suggested) = m.get(&format!("{}:{}", l.source, l.id)).cloned().unwrap_or((None, None));
+                    if uo && linked.is_some() { return None; }
+                    Some((l.clone(), linked, suggested))
+                })
+                .collect();
+            if !*pulled.read() {
+                rsx! {
+                    div { class: "card-cosmic p-8 text-center",
+                        p { class: "text-stardust", "Pull your Shopify + Etsy listings to link them to catalog pieces." }
+                    }
+                }
+            } else if rows.is_empty() {
+                let msg = if listings.read().is_empty() {
+                    "No listings were returned from Shopify/Etsy."
+                } else if *unlinked_only.read() {
+                    "All pulled listings are linked. Turn off \"Unlinked only\" to view them."
+                } else {
+                    "No listings match your filters."
+                };
+                rsx! {
+                    div { class: "card-cosmic p-8 text-center",
+                        p { class: "text-stardust", "{msg}" }
+                    }
+                }
+            } else {
+                rsx! {
+                    div { class: "card-cosmic overflow-hidden",
+                        div { class: "overflow-x-auto",
+                            table { class: "table-cosmic table-orders",
+                                thead {
+                                    tr {
+                                        th { class: "th-thumb", "" }
+                                        th { "Listing" }
+                                        th { "Source" }
+                                        th { "Price" }
+                                        th { "Catalog piece" }
+                                    }
+                                }
+                                tbody {
+                                    for (listing, linked, suggested) in rows {
+                                        ListingRow {
+                                            key: "{listing.source}:{listing.id}",
+                                            listing,
+                                            linked,
+                                            suggested,
+                                            catalog_names: catalog_names.clone(),
+                                            on_link: move |(piece, l): (String, model::Listing)| {
+                                                spawn(async move {
+                                                    match api::link_listing(piece.clone(), l.title.clone(), l.image_url.clone(), Some(l.price)).await {
+                                                        Ok(()) => {
+                                                            log::app_log("INFO", format!("Linked \"{}\" to \"{}\"", l.title, piece));
+                                                            if let Ok(c) = api::fetch_catalog().await { catalog.set(c); }
+                                                        }
+                                                        Err(e) => log::app_log("ERROR", format!("Link listing: {}", e)),
+                                                    }
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn ListingRow(
+    listing: model::Listing,
+    linked: Option<String>,
+    suggested: Option<String>,
+    catalog_names: Vec<String>,
+    on_link: EventHandler<(String, model::Listing)>,
+) -> Element {
+    let mut pick = use_signal(|| suggested.clone().unwrap_or_default());
+    let source_badge = if listing.source == "etsy" { "badge badge-nebula" } else { "badge badge-method" };
+    let price_str = format!("$ {:.2}", listing.price);
+    rsx! {
+        tr {
+            td { class: "td-thumb",
+                {match listing.image_url.as_deref() {
+                    Some(url) => rsx! { img { class: "order-thumb", src: "{url}", alt: "" } },
+                    None => rsx! { span { class: "order-thumb-placeholder", "pkg" } },
+                }}
+            }
+            td {
+                div { class: "font-semibold text-star-white", "{listing.title}" }
+            }
+            td { class: "td-nowrap",
+                span { class: "{source_badge}", "{listing.source}" }
+            }
+            td { class: "td-nowrap font-mono text-star-white", "{price_str}" }
+            td {
+                {if let Some(p) = linked.as_ref() {
+                    rsx! { span { class: "badge badge-success", "Linked \u{2192} {p}" } }
+                } else {
+                    rsx! {
+                        div { class: "flex items-center gap-2 flex-wrap",
+                            select {
+                                class: "link-select",
+                                onchange: move |e| pick.set(e.value()),
+                                option { value: "", "Choose piece..." }
+                                for nm in catalog_names.iter() {
+                                    option { value: "{nm}", selected: *pick.read() == *nm, "{nm}" }
+                                }
+                            }
+                            button {
+                                class: "btn-nebula text-sm", r#type: "button",
+                                onclick: {
+                                    let listing = listing.clone();
+                                    move |_| {
+                                        let p = pick.read().clone();
+                                        if !p.is_empty() {
+                                            on_link.call((p, listing.clone()));
+                                        }
+                                    }
+                                },
+                                "Link"
+                            }
+                        }
+                    }
+                }}
+            }
         }
     }
 }

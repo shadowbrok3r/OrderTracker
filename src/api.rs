@@ -4,7 +4,14 @@
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{CatalogPiece, Order};
+use crate::model::{CatalogPiece, Listing, Order};
+
+/// Result of a one-time bulk pull of Shopify + Etsy listings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListingsResult {
+    pub listings: Vec<Listing>,
+    pub errors: Vec<String>,
+}
 
 /// Result of fetching orders from all sources.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,6 +180,36 @@ pub async fn set_order_stage(key: String, stage: String) -> Result<(), ServerFnE
 pub async fn set_size_override(key: String, idx: usize, size: String) -> Result<(), ServerFnError> {
     crate::db::ensure_db_init().await.map_err(|e| ServerFnError::new(e))?;
     crate::db::set_size_override(&key, idx as i64, &size)
+        .await
+        .map_err(|e| ServerFnError::new(e))
+}
+
+/// One-time bulk pull of all Shopify + Etsy listings (errors collected per source).
+#[server]
+pub async fn fetch_listings() -> Result<ListingsResult, ServerFnError> {
+    let mut listings = Vec::new();
+    let mut errors = Vec::new();
+    match crate::shopify::fetch_shopify_listings().await {
+        Ok(v) => listings.extend(v),
+        Err(e) => errors.push(format!("Shopify: {}", e)),
+    }
+    match crate::etsy::fetch_etsy_listings().await {
+        Ok(v) => listings.extend(v),
+        Err(e) => errors.push(format!("Etsy: {}", e)),
+    }
+    Ok(ListingsResult { listings, errors })
+}
+
+/// Link a storefront listing to a catalog piece: product_key + thumbnail + sale price.
+#[server]
+pub async fn link_listing(
+    piece_name: String,
+    title: String,
+    image_url: Option<String>,
+    sale_price: Option<f64>,
+) -> Result<(), ServerFnError> {
+    crate::db::ensure_db_init().await.map_err(|e| ServerFnError::new(e))?;
+    crate::db::link_listing(&piece_name, &title, image_url.as_deref(), sale_price)
         .await
         .map_err(|e| ServerFnError::new(e))
 }

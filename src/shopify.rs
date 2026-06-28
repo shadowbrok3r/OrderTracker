@@ -307,3 +307,106 @@ pub async fn fetch_shopify_orders() -> Result<Vec<Order>, String> {
 
     Ok(orders)
 }
+
+// ---------------------------------------------------------------------------
+// Listings (products) — bulk pull for catalog linking
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct ShopifyListingsResponse {
+    products: Vec<ShopifyListing>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShopifyListing {
+    id: i64,
+    title: String,
+    image: Option<ShopifyImage>,
+    #[serde(default)]
+    variants: Vec<ShopifyListingVariant>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShopifyListingVariant {
+    #[serde(default)]
+    price: Option<String>,
+}
+
+/// Extract the page_info cursor from the rel="next" segment of a Link header.
+fn next_page_info(link_header: &str) -> Option<String> {
+    for part in link_header.split(',') {
+        if part.contains("rel=\"next\"") {
+            let start = part.find('<')? + 1;
+            let end = part.find('>')?;
+            for kv in part[start..end].split(['?', '&']) {
+                if let Some(pi) = kv.strip_prefix("page_info=") {
+                    return Some(pi.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Fetch ALL Shopify products (cursor pagination via the Link header). Price is
+/// the minimum variant price; image is the product's primary image.
+pub async fn fetch_shopify_listings() -> Result<Vec<crate::model::Listing>, String> {
+    let base = shopify_url();
+    let token = shopify_access_token();
+    if base.is_empty() || token.is_empty() {
+        return Err("Shopify not configured".to_string());
+    }
+    let client = reqwest::Client::new();
+    let fields = "id,title,handle,status,image,variants";
+    let mut url = format!("{}/products.json?limit=250&fields={}", base, fields);
+    let mut out = Vec::new();
+    loop {
+        let resp = client
+            .get(&url)
+            .header("X-Shopify-Access-Token", &token)
+            .send()
+            .await
+            .map_err(|e| format!("Shopify request failed: {}", e))?;
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let wait = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(2.0);
+            tokio::time::sleep(std::time::Duration::from_secs_f32(wait)).await;
+            continue;
+        }
+        if !resp.status().is_success() {
+            return Err(format!("Shopify API error: {}", resp.status()));
+        }
+        let link = resp
+            .headers()
+            .get(reqwest::header::LINK)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let body: ShopifyListingsResponse = resp
+            .json()
+            .await
+            .map_err(|e| format!("Shopify listings parse failed: {}", e))?;
+        for p in body.products {
+            let price = p
+                .variants
+                .iter()
+                .filter_map(|v| v.price.as_ref().and_then(|s| s.parse::<f64>().ok()))
+                .fold(f64::INFINITY, f64::min);
+            out.push(crate::model::Listing {
+                source: "shopify".to_string(),
+                id: p.id.to_string(),
+                title: p.title,
+                price: if price.is_finite() { price } else { 0.0 },
+                image_url: p.image.and_then(|i| i.src),
+            });
+        }
+        match link.as_deref().and_then(next_page_info) {
+            Some(pi) => url = format!("{}/products.json?limit=250&fields={}&page_info={}", base, fields, pi),
+            None => break,
+        }
+    }
+    Ok(out)
+}

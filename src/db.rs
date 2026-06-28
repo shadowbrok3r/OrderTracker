@@ -578,13 +578,76 @@ pub async fn link_product(piece_name: &str, product_key: &str) -> Result<(), Str
     Ok(())
 }
 
+/// Link a Shopify/Etsy listing to a catalog piece: add the listing title to
+/// product_keys, cache its image as the piece thumbnail, and record sale price.
+pub async fn link_listing(
+    piece_name: &str,
+    product_key: &str,
+    image_url: Option<&str>,
+    sale_price: Option<f64>,
+) -> Result<(), String> {
+    link_product(piece_name, product_key).await?;
+
+    let thumb_file = match image_url {
+        Some(url) if url.starts_with("http") => {
+            let client = reqwest::Client::new();
+            cache_thumbnail(&client, url)
+                .await
+                .and_then(|p| p.strip_prefix("thumb/").map(|k| File::new(THUMB_BUCKET, k)))
+        }
+        _ => None,
+    };
+
+    if let Some(file) = thumb_file {
+        DB.query("UPDATE jewelry SET thumbnail = $t, sale_price = $p ?? sale_price WHERE name = $name")
+            .bind(("name", piece_name.to_string()))
+            .bind(("t", file))
+            .bind(("p", sale_price))
+            .await
+            .map_err(|e| e.to_string())?
+            .check()
+            .map_err(|e| e.to_string())?;
+    } else if sale_price.is_some() {
+        DB.query("UPDATE jewelry SET sale_price = $p WHERE name = $name")
+            .bind(("name", piece_name.to_string()))
+            .bind(("p", sale_price))
+            .await
+            .map_err(|e| e.to_string())?
+            .check()
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Server-side catalog row: thumbnail is a native file pointer, mapped to the
+/// served "thumb/<key>" path for [CatalogPiece].
+#[derive(SurrealValue)]
+struct CatalogRowDb {
+    name: String,
+    kind: String,
+    product_keys: Option<Vec<String>>,
+    thumbnail: Option<File>,
+    sale_price: Option<f64>,
+    sizes: Vec<crate::model::PieceCostSize>,
+}
+
 /// Load the catalog: every jewelry piece with its linked piece_costs sizes.
 pub async fn load_catalog() -> Result<Vec<crate::model::CatalogPiece>, String> {
-    let q = "SELECT name, kind, product_keys, \
+    let q = "SELECT name, kind, product_keys, thumbnail, sale_price, \
         (SELECT ring_size, volume_cm3, silver_g, silver_usd, gold_g, gold_usd, bronze_g, bronze_usd, wax_usd \
          FROM piece_costs WHERE design_key = $parent.id) AS sizes \
         FROM jewelry ORDER BY name";
     let mut res = DB.query(q).await.map_err(|e| e.to_string())?;
-    let pieces: Vec<crate::model::CatalogPiece> = res.take(0).map_err(|e| e.to_string())?;
-    Ok(pieces)
+    let rows: Vec<CatalogRowDb> = res.take(0).map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|r| crate::model::CatalogPiece {
+            name: r.name,
+            kind: r.kind,
+            product_keys: r.product_keys,
+            thumbnail: r.thumbnail.map(|f| format!("thumb/{}", f.key().trim_start_matches('/'))),
+            sale_price: r.sale_price,
+            sizes: r.sizes,
+        })
+        .collect())
 }

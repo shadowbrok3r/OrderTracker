@@ -179,6 +179,9 @@ struct EtsyVariation {
 struct EtsyListingImage {
     url_75x75: Option<String>,
     url_170x135: Option<String>,
+    #[serde(rename = "url_570xN")]
+    url_570xn: Option<String>,
+    url_640x640: Option<String>,
 }
 
 async fn fetch_listing_image_urls(
@@ -273,8 +276,9 @@ pub async fn fetch_etsy_orders() -> Result<Vec<Order>, String> {
         let page: EtsyReceiptsResponse = match serde_json::from_str(&raw_body) {
             Ok(p) => p,
             Err(e) => {
-                let preview = if raw_body.len() > 1500 {
-                    format!("{}... (truncated)", &raw_body[..1500])
+                let preview = if raw_body.chars().nth(1500).is_some() {
+                    let s: String = raw_body.chars().take(1500).collect();
+                    format!("{}... (truncated)", s)
                 } else {
                     raw_body.clone()
                 };
@@ -480,4 +484,101 @@ pub async fn fetch_etsy_orders() -> Result<Vec<Order>, String> {
 
     log::app_log("INFO", format!("Etsy: built {} orders", orders.len()));
     Ok(orders)
+}
+
+// ---------------------------------------------------------------------------
+// Listings — bulk pull for catalog linking
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct EtsyListingsResponse {
+    results: Vec<EtsyListing>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EtsyListing {
+    listing_id: i64,
+    title: Option<String>,
+    price: Option<EtsyMoney>,
+    #[serde(default)]
+    images: Vec<EtsyListingImage>,
+}
+
+/// Fetch all shop listings (active + draft + inactive) with images embedded via
+/// includes=Images. Requires the `listings_r` OAuth scope (else 403).
+pub async fn fetch_etsy_listings() -> Result<Vec<crate::model::Listing>, String> {
+    let access_token = get_etsy_access_token().await?;
+    let shop_id = etsy_shop_id();
+    if shop_id.is_empty() {
+        return Err("ETSY_SHOP_ID not set".to_string());
+    }
+    let client = reqwest::Client::new();
+    let x_api_key = format!("{}:{}", etsy_keystring(), etsy_secret());
+    let base = format!("https://api.etsy.com/v3/application/shops/{}/listings", shop_id);
+    const LIMIT: i32 = 100;
+    let mut out = Vec::new();
+
+    for state in ["active", "draft", "inactive"] {
+        let mut offset = 0i32;
+        loop {
+            let url = format!("{}?state={}&limit={}&offset={}&includes=Images", base, state, LIMIT, offset);
+            let resp = client
+                .get(&url)
+                .header("x-api-key", &x_api_key)
+                .header("Authorization", format!("Bearer {}", access_token))
+                .send()
+                .await
+                .map_err(|e| format!("Etsy request failed: {}", e))?;
+            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                let wait = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .unwrap_or(2.0);
+                tokio::time::sleep(std::time::Duration::from_secs_f32(wait)).await;
+                continue;
+            }
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let hint = if status == reqwest::StatusCode::FORBIDDEN {
+                    " (reconnect Etsy with the listings_r scope)"
+                } else {
+                    ""
+                };
+                return Err(format!("Etsy listings {} error: {}{}", state, status, hint));
+            }
+            let page: EtsyListingsResponse = resp
+                .json()
+                .await
+                .map_err(|e| format!("Etsy listings parse failed: {}", e))?;
+            let n = page.results.len() as i32;
+            for l in page.results {
+                let price = l
+                    .price
+                    .as_ref()
+                    .map(|m| (m.amount.unwrap_or(0) as f64) / (m.divisor.unwrap_or(100).max(1) as f64))
+                    .unwrap_or(0.0);
+                let image_url = l.images.first().and_then(|img| {
+                    img.url_570xn
+                        .clone()
+                        .or_else(|| img.url_640x640.clone())
+                        .or_else(|| img.url_170x135.clone())
+                        .or_else(|| img.url_75x75.clone())
+                });
+                out.push(crate::model::Listing {
+                    source: "etsy".to_string(),
+                    id: l.listing_id.to_string(),
+                    title: l.title.unwrap_or_else(|| "Untitled".to_string()),
+                    price,
+                    image_url,
+                });
+            }
+            if n < LIMIT {
+                break;
+            }
+            offset += LIMIT;
+        }
+    }
+    Ok(out)
 }

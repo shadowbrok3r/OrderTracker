@@ -132,6 +132,16 @@ pub struct OrderItem {
     pub image_url: Option<String>,
 }
 
+/// A storefront product/listing pulled from Shopify or Etsy for catalog linking.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Listing {
+    pub source: String, // "shopify" | "etsy"
+    pub id: String,
+    pub title: String,
+    pub price: f64,
+    pub image_url: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Piece cost types & matching (shared between server DB logic and client UI)
 // ---------------------------------------------------------------------------
