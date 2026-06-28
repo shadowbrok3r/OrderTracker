@@ -167,3 +167,12 @@ pub async fn set_order_stage(key: String, stage: String) -> Result<(), ServerFnE
         .await
         .map_err(|e| ServerFnError::new(e))
 }
+
+/// Override (or clear) the ring size of one order item (re-prices from catalog).
+#[server]
+pub async fn set_size_override(key: String, idx: usize, size: String) -> Result<(), ServerFnError> {
+    crate::db::ensure_db_init().await.map_err(|e| ServerFnError::new(e))?;
+    crate::db::set_size_override(&key, idx as i64, &size)
+        .await
+        .map_err(|e| ServerFnError::new(e))
+}

@@ -966,6 +966,21 @@ fn App() -> Element {
                                     if let Some(o) = os.iter_mut().find(|o| o.state_key() == key) {
                                         o.stage = if stage.is_empty() { None } else { Some(stage) };
                                     }
+                                },
+                                on_set_size: move |(key, idx, size): (String, usize, String)| {
+                                    spawn(async move {
+                                        if let Err(e) = api::set_size_override(key.clone(), idx, size).await {
+                                            log::app_log("ERROR", format!("Set size: {}", e));
+                                            return;
+                                        }
+                                        // Re-merge so weight/cost/margin re-resolve for the new size.
+                                        if let Ok(result) = api::fetch_all_orders().await {
+                                            if let Some(o) = result.orders.iter().find(|o| o.state_key() == key) {
+                                                detail_order.set(Some(o.clone()));
+                                            }
+                                            orders.set(result.orders);
+                                        }
+                                    });
                                 }
                             }
                         }
@@ -1571,6 +1586,7 @@ fn OrderDetailDialog(
     on_link: EventHandler<(String, String)>,
     on_set_notes: EventHandler<(String, String)>,
     on_set_stage: EventHandler<(String, String)>,
+    on_set_size: EventHandler<(String, usize, String)>,
 ) -> Element {
     let source_label = match order.source {
         OrderSource::Shopify => "Shopify",
@@ -1779,12 +1795,15 @@ fn OrderDetailDialog(
             div { class: "mt-4",
                 p { class: "text-stardust text-sm font-medium mb-2", "Items" }
                 div { class: "space-y-3",
-                    for item in order.items.iter() {
+                    for (idx, item) in order.items.iter().enumerate() {
                         OrderDetailItemRow {
                             item: item.clone(),
                             cost_weight: lookup_piece_cost(item, &catalog),
                             catalog_names: catalog_names.clone(),
                             on_link,
+                            index: idx,
+                            state_key: order.state_key(),
+                            on_set_size,
                         }
                     }
                 }
@@ -1799,8 +1818,14 @@ fn OrderDetailItemRow(
     cost_weight: Option<ItemCostWeight>,
     catalog_names: Vec<String>,
     on_link: EventHandler<(String, String)>,
+    index: usize,
+    state_key: String,
+    on_set_size: EventHandler<(String, usize, String)>,
 ) -> Element {
     let mut pick = use_signal(String::new);
+    let mut size_input = use_signal(|| item.ring_size.clone().unwrap_or_default());
+    let has_size = item.ring_size.is_some();
+    let sk_size = state_key.clone();
     let price_str = format!("${:.2}", item.price);
     let (cost_str, weight_str) = match &cost_weight {
         Some(cw) => (
@@ -1834,6 +1859,25 @@ fn OrderDetailItemRow(
                 p { class: "text-stardust text-sm mt-1",
                     "Our cost: {cost_str} | Margin: {margin_str} | Weight: {weight_str}"
                 }
+                {has_size.then(|| rsx! {
+                    div { class: "link-row",
+                        span { class: "text-stardust text-xs", "Resize:" }
+                        input {
+                            r#type: "text", class: "dl-size", placeholder: "size",
+                            value: "{size_input}",
+                            oninput: move |e| size_input.set(e.value())
+                        }
+                        button {
+                            class: "btn-cosmic text-sm", r#type: "button",
+                            onclick: move |_| {
+                                let raw = size_input.read().clone();
+                                let norm = model::format_ring_size(&raw).unwrap_or_else(|| raw.trim().to_string());
+                                on_set_size.call((sk_size.clone(), index, norm));
+                            },
+                            "Set size"
+                        }
+                    }
+                })}
                 {unresolved.then(|| rsx! {
                     div { class: "link-row",
                         span { class: "text-stardust text-xs", "Not in catalog \u{2014} link to:" }

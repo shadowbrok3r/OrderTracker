@@ -220,6 +220,12 @@ pub async fn save_orders(orders: &[Order]) -> Result<(), String> {
 // Order state overlay + custom orders
 // ---------------------------------------------------------------------------
 
+#[derive(SurrealValue, Clone)]
+struct SizeOverride {
+    idx: i64,
+    size: String,
+}
+
 #[derive(SurrealValue)]
 struct OrderStateRow {
     rid: String,
@@ -227,6 +233,7 @@ struct OrderStateRow {
     completed: bool,
     notes: Option<String>,
     stage: Option<String>,
+    size_overrides: Option<Vec<SizeOverride>>,
 }
 
 /// Per-order overlay persisted in order_state (keyed by Order::state_key).
@@ -236,12 +243,14 @@ pub struct OrderStateData {
     pub completed: bool,
     pub notes: Option<String>,
     pub stage: Option<String>,
+    /// item index -> overridden ring size.
+    pub size_overrides: std::collections::HashMap<usize, String>,
 }
 
 /// Map of state_key -> overlay from the persistent order_state table.
 pub async fn load_order_state() -> Result<std::collections::HashMap<String, OrderStateData>, String> {
     let mut res = DB
-        .query("SELECT <string>id AS rid, archived ?? false AS archived, completed ?? false AS completed, notes, stage FROM order_state")
+        .query("SELECT <string>id AS rid, archived ?? false AS archived, completed ?? false AS completed, notes, stage, size_overrides FROM order_state")
         .await
         .map_err(|e| e.to_string())?;
     let rows: Vec<OrderStateRow> = res.take(0).map_err(|e| e.to_string())?;
@@ -249,6 +258,13 @@ pub async fn load_order_state() -> Result<std::collections::HashMap<String, Orde
         .into_iter()
         .map(|r| {
             let key = r.rid.strip_prefix("order_state:").unwrap_or(&r.rid).to_string();
+            let size_overrides = r
+                .size_overrides
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|o| o.idx >= 0)
+                .map(|o| (o.idx as usize, o.size))
+                .collect();
             (
                 key,
                 OrderStateData {
@@ -256,6 +272,7 @@ pub async fn load_order_state() -> Result<std::collections::HashMap<String, Orde
                     completed: r.completed,
                     notes: r.notes,
                     stage: r.stage,
+                    size_overrides,
                 },
             )
         })
@@ -298,6 +315,31 @@ pub async fn set_order_stage(key: &str, stage: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .check()
         .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Override (or clear, when `size` is empty) the ring size of item `idx` in an
+/// order. Stored on order_state so it survives the cache and re-prices from the
+/// catalog for the new size.
+pub async fn set_size_override(key: &str, idx: i64, size: &str) -> Result<(), String> {
+    if size.trim().is_empty() {
+        DB.query("UPSERT type::record('order_state', $key) SET size_overrides = (size_overrides ?? []).filter(|$o| $o.idx != $idx)")
+            .bind(("key", key.to_string()))
+            .bind(("idx", idx))
+            .await
+            .map_err(|e| e.to_string())?
+            .check()
+            .map_err(|e| e.to_string())?;
+    } else {
+        DB.query("UPSERT type::record('order_state', $key) SET size_overrides = (size_overrides ?? []).filter(|$o| $o.idx != $idx) + [{ idx: $idx, size: $size }]")
+            .bind(("key", key.to_string()))
+            .bind(("idx", idx))
+            .bind(("size", size.to_string()))
+            .await
+            .map_err(|e| e.to_string())?
+            .check()
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -393,6 +435,11 @@ pub async fn merge_orders(mut base: Vec<Order>) -> Vec<Order> {
                 o.completed = s.completed;
                 o.notes = s.notes.clone();
                 o.stage = s.stage.clone();
+                for (i, item) in o.items.iter_mut().enumerate() {
+                    if let Some(sz) = s.size_overrides.get(&i) {
+                        item.ring_size = Some(sz.clone());
+                    }
+                }
             }
         }
     }
