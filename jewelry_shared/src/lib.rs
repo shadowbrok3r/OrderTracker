@@ -64,6 +64,9 @@ pub struct CatalogPiece {
     /// Served thumbnail path ("thumb/<key>") cached from a linked listing image.
     #[serde(default)]
     pub thumbnail: Option<String>,
+    /// Served path ("thumb/<key>") of the STL render snapshot of this model.
+    #[serde(default)]
+    pub render: Option<String>,
     /// Last recorded marketplace sale price (drives catalog margin).
     #[serde(default)]
     pub sale_price: Option<f64>,

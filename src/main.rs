@@ -1430,7 +1430,7 @@ fn CatalogPieceCard(piece: CatalogPiece) -> Element {
     rsx! {
         details { class: "catalog-piece",
             summary { class: "catalog-summary",
-                {match piece.thumbnail.as_deref() {
+                {match piece.render.as_deref().or(piece.thumbnail.as_deref()) {
                     Some(url) => rsx! { img { class: "order-thumb", src: "{url}", alt: "" } },
                     None => rsx! { span { class: "order-thumb-placeholder", "pkg" } },
                 }}
@@ -1493,21 +1493,64 @@ fn CatalogRow(size: PieceCostSize) -> Element {
     }
 }
 
+/// Pull listings from one marketplace and merge them in, replacing that source's
+/// rows so a separate Etsy/Shopify pull doesn't clobber the other's results.
+fn pull_listings(
+    src: &'static str,
+    mut listings: Signal<Vec<model::Listing>>,
+    mut pulling: Signal<Option<String>>,
+    mut errors: Signal<Vec<String>>,
+    mut pulled: Signal<bool>,
+) {
+    if pulling.read().is_some() {
+        return;
+    }
+    pulling.set(Some(src.to_string()));
+    errors.set(Vec::new());
+    spawn(async move {
+        log::app_log("INFO", format!("Pulling {} listings...", src));
+        match api::fetch_listings(src.to_string()).await {
+            Ok(result) => {
+                log::app_log("INFO", format!("Pulled {} {} listings.", result.listings.len(), src));
+                for e in &result.errors {
+                    log::app_log("ERROR", e.clone());
+                }
+                let mut cur: Vec<model::Listing> =
+                    listings.read().iter().filter(|l| l.source != src).cloned().collect();
+                cur.extend(result.listings);
+                listings.set(cur);
+                errors.set(result.errors);
+                pulled.set(true);
+            }
+            Err(e) => {
+                log::app_log("ERROR", format!("Pull {}: {}", src, e));
+                errors.set(vec![e.to_string()]);
+            }
+        }
+        pulling.set(None);
+    });
+}
+
 #[component]
 fn ListingsView(catalog: Signal<Vec<CatalogPiece>>) -> Element {
-    let mut listings = use_signal(Vec::<model::Listing>::new);
-    let mut pulling = use_signal(|| false);
-    let mut errors = use_signal(Vec::<String>::new);
-    let mut pulled = use_signal(|| false);
+    let listings = use_signal(Vec::<model::Listing>::new);
+    let pulling = use_signal(|| Option::<String>::None);
+    let errors = use_signal(Vec::<String>::new);
+    let pulled = use_signal(|| false);
     let mut search = use_signal(String::new);
     let mut source_filter = use_signal(|| "all".to_string());
-    let mut unlinked_only = use_signal(|| true);
+    let mut view = use_signal(|| "tolink".to_string());
 
     let catalog_names = {
         let mut n: Vec<String> = catalog.read().iter().map(|p| p.name.clone()).collect();
         n.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
         n
     };
+    let render_by_name: std::collections::HashMap<String, String> = catalog
+        .read()
+        .iter()
+        .filter_map(|p| p.render.clone().map(|r| (p.name.clone(), r)))
+        .collect();
 
     let matches = use_memo(move || {
         let cat = catalog.read();
@@ -1520,12 +1563,16 @@ fn ListingsView(catalog: Signal<Vec<CatalogPiece>>) -> Element {
 
     let total = listings.read().len();
     let linked_count = matches.read().values().filter(|(linked, _)| linked.is_some()).count();
+    let tolink_count = total - linked_count;
 
     rsx! {
         div { class: "card-cosmic p-6 mb-6",
             div { class: "flex items-center justify-between flex-wrap gap-3 mb-4",
                 h2 { class: "text-xl font-bold text-star-white", "Listings" }
-                span { class: "text-stardust text-sm", "{linked_count} linked \u{00b7} {total} pulled" }
+                div { class: "flex gap-2",
+                    FilterButton { label: format!("To link ({tolink_count})"), active: *view.read() == "tolink", onclick: move |_| view.set("tolink".to_string()) }
+                    FilterButton { label: format!("Linked ({linked_count})"), active: *view.read() == "linked", onclick: move |_| view.set("linked".to_string()) }
+                }
             }
             div { class: "flex flex-wrap items-center gap-4",
                 div { class: "flex-1 min-w-0",
@@ -1538,29 +1585,18 @@ fn ListingsView(catalog: Signal<Vec<CatalogPiece>>) -> Element {
                     FilterButton { label: "All", active: *source_filter.read() == "all", onclick: move |_| source_filter.set("all".to_string()) }
                     FilterButton { label: "Shopify", active: *source_filter.read() == "shopify", onclick: move |_| source_filter.set("shopify".to_string()) }
                     FilterButton { label: "Etsy", active: *source_filter.read() == "etsy", onclick: move |_| source_filter.set("etsy".to_string()) }
-                    FilterButton { label: "Unlinked only", active: *unlinked_only.read(), onclick: move |_| { let v = *unlinked_only.read(); unlinked_only.set(!v); } }
                 }
-                button {
-                    class: "btn-nebula", disabled: *pulling.read(),
-                    onclick: move |_| {
-                        pulling.set(true);
-                        errors.set(Vec::new());
-                        spawn(async move {
-                            log::app_log("INFO", "Pulling Shopify + Etsy listings...");
-                            match api::fetch_listings().await {
-                                Ok(result) => {
-                                    log::app_log("INFO", format!("Pulled {} listings.", result.listings.len()));
-                                    for e in &result.errors { log::app_log("ERROR", e.clone()); }
-                                    errors.set(result.errors);
-                                    listings.set(result.listings);
-                                    pulled.set(true);
-                                }
-                                Err(e) => errors.set(vec![e.to_string()]),
-                            }
-                            pulling.set(false);
-                        });
-                    },
-                    {if *pulling.read() { "Pulling..." } else { "Pull listings" }}
+                div { class: "flex gap-2",
+                    button {
+                        class: "btn-nebula", disabled: pulling.read().is_some(),
+                        onclick: move |_| pull_listings("shopify", listings, pulling, errors, pulled),
+                        {if pulling.read().as_deref() == Some("shopify") { "Pulling..." } else { "Pull Shopify" }}
+                    }
+                    button {
+                        class: "btn-cosmic", disabled: pulling.read().is_some(),
+                        onclick: move |_| pull_listings("etsy", listings, pulling, errors, pulled),
+                        {if pulling.read().as_deref() == Some("etsy") { "Pulling..." } else { "Pull Etsy" }}
+                    }
                 }
             }
         }
@@ -1576,32 +1612,33 @@ fn ListingsView(catalog: Signal<Vec<CatalogPiece>>) -> Element {
         {
             let q = search.read().to_lowercase();
             let sf = source_filter.read().clone();
-            let uo = *unlinked_only.read();
+            let want_linked = *view.read() == "linked";
             let m = matches.read();
-            let rows: Vec<(model::Listing, Option<String>, Option<String>)> = listings
+            let rows: Vec<(model::Listing, Option<String>, Option<String>, Option<String>)> = listings
                 .read()
                 .iter()
                 .filter(|l| sf == "all" || l.source == sf)
                 .filter(|l| q.is_empty() || l.title.to_lowercase().contains(&q))
                 .filter_map(|l| {
                     let (linked, suggested) = m.get(&format!("{}:{}", l.source, l.id)).cloned().unwrap_or((None, None));
-                    if uo && linked.is_some() { return None; }
-                    Some((l.clone(), linked, suggested))
+                    if want_linked != linked.is_some() { return None; }
+                    let render = linked.as_ref().and_then(|n| render_by_name.get(n).cloned());
+                    Some((l.clone(), linked, suggested, render))
                 })
                 .collect();
             if !*pulled.read() {
                 rsx! {
                     div { class: "card-cosmic p-8 text-center",
-                        p { class: "text-stardust", "Pull your Shopify + Etsy listings to link them to catalog pieces." }
+                        p { class: "text-stardust", "Pull your Shopify or Etsy listings to link them to catalog pieces." }
                     }
                 }
             } else if rows.is_empty() {
-                let msg = if listings.read().is_empty() {
-                    "No listings were returned from Shopify/Etsy."
-                } else if *unlinked_only.read() {
-                    "All pulled listings are linked. Turn off \"Unlinked only\" to view them."
+                let msg = if want_linked {
+                    "No listings linked yet. Link one from the \"To link\" tab."
+                } else if total == 0 {
+                    "No listings were returned. Pull Shopify or Etsy above."
                 } else {
-                    "No listings match your filters."
+                    "Nothing left to link here \u{2014} try another source or clear the search."
                 };
                 rsx! {
                     div { class: "card-cosmic p-8 text-center",
@@ -1619,16 +1656,17 @@ fn ListingsView(catalog: Signal<Vec<CatalogPiece>>) -> Element {
                                         th { "Listing" }
                                         th { "Source" }
                                         th { "Price" }
-                                        th { "Catalog piece" }
+                                        th { {if want_linked { "Model \u{00b7} piece" } else { "Catalog piece" }} }
                                     }
                                 }
                                 tbody {
-                                    for (listing, linked, suggested) in rows {
+                                    for (listing, linked, suggested, render) in rows {
                                         ListingRow {
                                             key: "{listing.source}:{listing.id}",
                                             listing,
                                             linked,
                                             suggested,
+                                            render,
                                             catalog_names: catalog_names.clone(),
                                             on_link: move |(piece, l): (String, model::Listing)| {
                                                 spawn(async move {
@@ -1658,6 +1696,7 @@ fn ListingRow(
     listing: model::Listing,
     linked: Option<String>,
     suggested: Option<String>,
+    render: Option<String>,
     catalog_names: Vec<String>,
     on_link: EventHandler<(String, model::Listing)>,
 ) -> Element {
@@ -1681,7 +1720,15 @@ fn ListingRow(
             td { class: "td-nowrap font-mono text-star-white", "{price_str}" }
             td {
                 {if let Some(p) = linked.as_ref() {
-                    rsx! { span { class: "badge badge-success", "Linked \u{2192} {p}" } }
+                    rsx! {
+                        div { class: "flex items-center gap-2",
+                            {match render.as_deref() {
+                                Some(url) => rsx! { img { class: "order-thumb", src: "{url}", alt: "model", title: "STL render" } },
+                                None => rsx! { span { class: "order-thumb-placeholder", title: "No model render yet", "stl" } },
+                            }}
+                            span { class: "badge badge-success", "Linked \u{2192} {p}" }
+                        }
+                    }
                 } else {
                     rsx! {
                         div { class: "flex items-center gap-2 flex-wrap",

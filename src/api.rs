@@ -184,18 +184,23 @@ pub async fn set_size_override(key: String, idx: usize, size: String) -> Result<
         .map_err(|e| ServerFnError::new(e))
 }
 
-/// One-time bulk pull of all Shopify + Etsy listings (errors collected per source).
+/// Pull listings from one marketplace ("shopify" or "etsy") so a missing scope on
+/// one source doesn't block the other; errors are collected per source.
 #[server]
-pub async fn fetch_listings() -> Result<ListingsResult, ServerFnError> {
+pub async fn fetch_listings(source: String) -> Result<ListingsResult, ServerFnError> {
     let mut listings = Vec::new();
     let mut errors = Vec::new();
-    match crate::shopify::fetch_shopify_listings().await {
-        Ok(v) => listings.extend(v),
-        Err(e) => errors.push(format!("Shopify: {}", e)),
+    if source == "shopify" || source == "all" {
+        match crate::shopify::fetch_shopify_listings().await {
+            Ok(v) => listings.extend(v),
+            Err(e) => errors.push(format!("Shopify: {}", e)),
+        }
     }
-    match crate::etsy::fetch_etsy_listings().await {
-        Ok(v) => listings.extend(v),
-        Err(e) => errors.push(format!("Etsy: {}", e)),
+    if source == "etsy" || source == "all" {
+        match crate::etsy::fetch_etsy_listings().await {
+            Ok(v) => listings.extend(v),
+            Err(e) => errors.push(format!("Etsy: {}", e)),
+        }
     }
     Ok(ListingsResult { listings, errors })
 }

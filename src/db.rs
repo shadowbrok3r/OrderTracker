@@ -627,25 +627,28 @@ struct CatalogRowDb {
     kind: String,
     product_keys: Option<Vec<String>>,
     thumbnail: Option<File>,
+    render: Option<File>,
     sale_price: Option<f64>,
     sizes: Vec<crate::model::PieceCostSize>,
 }
 
 /// Load the catalog: every jewelry piece with its linked piece_costs sizes.
 pub async fn load_catalog() -> Result<Vec<crate::model::CatalogPiece>, String> {
-    let q = "SELECT name, kind, product_keys, thumbnail, sale_price, \
+    let q = "SELECT name, kind, product_keys, thumbnail, render, sale_price, \
         (SELECT ring_size, volume_cm3, silver_g, silver_usd, gold_g, gold_usd, bronze_g, bronze_usd, wax_usd \
          FROM piece_costs WHERE design_key = $parent.id) AS sizes \
         FROM jewelry ORDER BY name";
     let mut res = DB.query(q).await.map_err(|e| e.to_string())?;
     let rows: Vec<CatalogRowDb> = res.take(0).map_err(|e| e.to_string())?;
+    let thumb_path = |f: File| format!("thumb/{}", f.key().trim_start_matches('/'));
     Ok(rows
         .into_iter()
         .map(|r| crate::model::CatalogPiece {
             name: r.name,
             kind: r.kind,
             product_keys: r.product_keys,
-            thumbnail: r.thumbnail.map(|f| format!("thumb/{}", f.key().trim_start_matches('/'))),
+            thumbnail: r.thumbnail.map(thumb_path),
+            render: r.render.map(thumb_path),
             sale_price: r.sale_price,
             sizes: r.sizes,
         })
