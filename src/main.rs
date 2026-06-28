@@ -1533,13 +1533,25 @@ fn pull_listings(
 
 #[component]
 fn ListingsView(catalog: Signal<Vec<CatalogPiece>>) -> Element {
-    let listings = use_signal(Vec::<model::Listing>::new);
+    let mut listings = use_signal(Vec::<model::Listing>::new);
     let pulling = use_signal(|| Option::<String>::None);
     let errors = use_signal(Vec::<String>::new);
-    let pulled = use_signal(|| false);
+    let mut pulled = use_signal(|| false);
     let mut search = use_signal(String::new);
     let mut source_filter = use_signal(|| "all".to_string());
     let mut view = use_signal(|| "tolink".to_string());
+
+    // Load cached listings once so linked rows persist across a page refresh.
+    use_hook(|| {
+        spawn(async move {
+            if let Ok(v) = api::load_listings().await {
+                if !v.is_empty() {
+                    listings.set(v);
+                    pulled.set(true);
+                }
+            }
+        });
+    });
 
     let catalog_names = {
         let mut n: Vec<String> = catalog.read().iter().map(|p| p.name.clone()).collect();

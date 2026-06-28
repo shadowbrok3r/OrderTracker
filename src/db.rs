@@ -490,10 +490,10 @@ fn thumb_content_type(key: &str) -> &'static str {
     }
 }
 
-/// Keys are our own `<hash>.<ext>` slugs; reject anything else (the key is
-/// interpolated into the file literal).
+/// Keys are our own `<hash>.<ext>` / `render<slug>.png` slugs; reject anything
+/// else (the key is interpolated into the file literal).
 fn safe_key(key: &str) -> bool {
-    !key.is_empty() && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.')
+    !key.is_empty() && key.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 async fn thumb_exists(key: &str) -> bool {
@@ -651,6 +651,65 @@ pub async fn load_catalog() -> Result<Vec<crate::model::CatalogPiece>, String> {
             render: r.render.map(thumb_path),
             sale_price: r.sale_price,
             sizes: r.sizes,
+        })
+        .collect())
+}
+
+#[derive(SurrealValue)]
+struct ListingRowDb {
+    source: String,
+    listing_id: String,
+    title: String,
+    price: f64,
+    image_url: Option<String>,
+}
+
+/// Replace the cached listings for one marketplace with a fresh pull, so the
+/// Listings view (and its linked rows) survive a page refresh without re-pulling.
+pub async fn cache_listings(source: &str, items: &[crate::model::Listing]) -> Result<(), String> {
+    DB.query("DELETE listings WHERE source = $s")
+        .bind(("s", source.to_string()))
+        .await
+        .map_err(|e| e.to_string())?
+        .check()
+        .map_err(|e| e.to_string())?;
+    if items.is_empty() {
+        return Ok(());
+    }
+    let rows: Vec<ListingRowDb> = items
+        .iter()
+        .map(|l| ListingRowDb {
+            source: l.source.clone(),
+            listing_id: l.id.clone(),
+            title: l.title.clone(),
+            price: l.price,
+            image_url: l.image_url.clone(),
+        })
+        .collect();
+    DB.query("INSERT INTO listings $rows")
+        .bind(("rows", rows))
+        .await
+        .map_err(|e| e.to_string())?
+        .check()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Load every cached storefront listing.
+pub async fn load_listings() -> Result<Vec<crate::model::Listing>, String> {
+    let mut res = DB
+        .query("SELECT source, listing_id, title, price, image_url FROM listings ORDER BY title")
+        .await
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<ListingRowDb> = res.take(0).map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|r| crate::model::Listing {
+            source: r.source,
+            id: r.listing_id,
+            title: r.title,
+            price: r.price,
+            image_url: r.image_url,
         })
         .collect())
 }

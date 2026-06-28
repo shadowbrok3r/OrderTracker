@@ -202,7 +202,20 @@ pub async fn fetch_listings(source: String) -> Result<ListingsResult, ServerFnEr
             Err(e) => errors.push(format!("Etsy: {}", e)),
         }
     }
+    if !listings.is_empty() {
+        crate::db::ensure_db_init().await.map_err(|e| ServerFnError::new(e))?;
+        if let Err(e) = crate::db::cache_listings(&source, &listings).await {
+            errors.push(format!("Cache listings: {}", e));
+        }
+    }
     Ok(ListingsResult { listings, errors })
+}
+
+/// Cached storefront listings, served on page load so linked rows persist.
+#[server]
+pub async fn load_listings() -> Result<Vec<crate::model::Listing>, ServerFnError> {
+    crate::db::ensure_db_init().await.map_err(|e| ServerFnError::new(e))?;
+    crate::db::load_listings().await.map_err(|e| ServerFnError::new(e))
 }
 
 /// Link a storefront listing to a catalog piece: product_key + thumbnail + sale price.
