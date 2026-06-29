@@ -112,7 +112,7 @@ pub async fn push_orders(orders: &[Order]) {
         Ok(cat) => open
             .iter()
             .flat_map(|o| o.items.iter())
-            .filter(|i| i.metal_type != MetalType::Bronze)
+            .filter(|i| !matches!(i.metal_type, MetalType::Bronze | MetalType::SolidGold))
             .filter_map(|i| crate::model::lookup_piece_cost(i, &cat).map(|cw| cw.weight_g * i.quantity as f64))
             .sum(),
         Err(_) => 0.0,

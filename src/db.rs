@@ -60,6 +60,7 @@ use surrealdb_types::File;
 fn metal_tag(m: &MetalType) -> &'static str {
     match m {
         MetalType::Gold => "gold",
+        MetalType::SolidGold => "goldsolid",
         MetalType::Silver => "silver",
         MetalType::Bronze => "bronze",
         MetalType::Unknown => "unknown",

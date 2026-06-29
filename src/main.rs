@@ -425,7 +425,7 @@ fn App() -> Element {
             .iter()
             .filter(|o| !o.archived && !o.completed)
             .flat_map(|o| o.items.iter())
-            .filter(|item| item.metal_type != MetalType::Bronze)
+            .filter(|item| !matches!(item.metal_type, MetalType::Bronze | MetalType::SolidGold))
             .filter_map(|item| {
                 lookup_piece_cost(item, &cat).map(|cw| cw.weight_g * item.quantity as f64)
             })
@@ -941,6 +941,17 @@ fn App() -> Element {
                                                 log::app_log("INFO", format!("Linked \"{}\" to catalog \"{}\"", key, piece));
                                                 if let Ok(rows) = api::fetch_catalog().await {
                                                     catalog.set(rows);
+                                                }
+                                                // Re-resolve cost/margin for the open order detail now that
+                                                // the linked product_key exists in the catalog.
+                                                let open_key = detail_order.read().as_ref().map(|o| o.state_key());
+                                                if let Ok(result) = api::fetch_all_orders().await {
+                                                    if let Some(k) = open_key {
+                                                        if let Some(o) = result.orders.iter().find(|o| o.state_key() == k) {
+                                                            detail_order.set(Some(o.clone()));
+                                                        }
+                                                    }
+                                                    orders.set(result.orders);
                                                 }
                                             }
                                             Err(e) => log::app_log("ERROR", format!("Link product: {}", e)),

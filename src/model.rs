@@ -7,7 +7,10 @@ pub use jewelry_shared::{CatalogPiece, PieceCostRow, PieceCostSize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MetalType {
+    /// Gold-plated (cast in silver, then plated) — priced from the silver base.
     Gold,
+    /// Solid karat gold — priced from the 14K gold column.
+    SolidGold,
     Silver,
     Bronze,
     Unknown,
@@ -24,7 +27,10 @@ impl MetalType {
     /// ("Sterling Silver Skull Ring" with a Bronze material variation).
     pub fn from_string_opt(s: &str) -> Option<Self> {
         let lower = s.to_lowercase();
-        if lower.contains("gold") || lower.contains("14k") || lower.contains("18k") || lower.contains("10k") {
+        // Solid gold must be checked first ("goldsolid"/"solid gold" both contain "gold").
+        if lower.contains("goldsolid") || lower.contains("solid gold") || lower.contains("solid 14k") {
+            Some(MetalType::SolidGold)
+        } else if lower.contains("gold") || lower.contains("14k") || lower.contains("18k") || lower.contains("10k") {
             Some(MetalType::Gold)
         } else if lower.contains("silver") || lower.contains("sterling") || lower.contains("925") {
             Some(MetalType::Silver)
@@ -37,7 +43,7 @@ impl MetalType {
 
     pub fn display_class(&self) -> &'static str {
         match self {
-            MetalType::Gold => "badge-gold",
+            MetalType::Gold | MetalType::SolidGold => "badge-gold",
             MetalType::Silver => "badge-silver",
             MetalType::Bronze => "badge-bronze",
             MetalType::Unknown => "badge-nebula",
@@ -47,6 +53,7 @@ impl MetalType {
     pub fn display_name(&self) -> &'static str {
         match self {
             MetalType::Gold => "Gold Plated",
+            MetalType::SolidGold => "14K Gold",
             MetalType::Silver => "Silver",
             MetalType::Bronze => "Bronze",
             MetalType::Unknown => "Unknown",
@@ -327,6 +334,8 @@ fn pick_cost_weight_size(s: &PieceCostSize, metal: &MetalType) -> Option<ItemCos
         MetalType::Silver => (s.silver_usd.unwrap_or(0.0), s.silver_g.unwrap_or(0.0)),
         // "Gold Plated" pieces are cast in silver then plated, so cost from the silver base.
         MetalType::Gold => (s.silver_usd.unwrap_or(0.0), s.silver_g.unwrap_or(0.0)),
+        // Solid karat gold is cast in gold — cost from the 14K gold column.
+        MetalType::SolidGold => (s.gold_usd.unwrap_or(0.0), s.gold_g.unwrap_or(0.0)),
         MetalType::Bronze => (s.bronze_usd.unwrap_or(0.0), s.bronze_g.unwrap_or(0.0)),
         MetalType::Unknown => (s.silver_usd.unwrap_or(0.0), s.silver_g.unwrap_or(0.0)),
     };
