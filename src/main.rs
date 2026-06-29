@@ -1091,9 +1091,9 @@ fn App() -> Element {
                                         th { "Size" }
                                         th { "Due Date" }
                                         th { "Days Left" }
-                                        th { "Total" }
-                                        th { title: "Our cost (from catalog)", "Cost" }
-                                        th { title: "Sale price minus our cost", "Margin" }
+                                        th { class: "col-total", "Total" }
+                                        th { class: "col-cost", title: "Our cost (from catalog)", "Cost" }
+                                        th { class: "col-margin", title: "Sale price minus our cost", "Margin" }
                                         th { title: "Weight (g)", "Weight" }
                                         th { "Source" }
                                     }
@@ -1931,11 +1931,11 @@ fn OrderRow(
                     }
                 }
             }
-            td { class: "td-nowrap text-star-white font-semibold",
+            td { class: "td-nowrap font-semibold col-total",
                 {format!("$ {:.2}", order.total_price)}
             }
-            td { class: "td-nowrap text-stardust", title: "Our cost (from catalog)", "{cost_str}" }
-            td { class: "{margin_class}", title: "Sale price minus our cost", "{margin_str}" }
+            td { class: "td-nowrap col-cost", title: "Our cost (from catalog)", "{cost_str}" }
+            td { class: "{margin_class} col-margin", title: "Sale price minus our cost", "{margin_str}" }
             td { class: "td-nowrap text-stardust", title: "Weight (g)", "{weight_str}" }
             td { class: "td-nowrap",
                 {
