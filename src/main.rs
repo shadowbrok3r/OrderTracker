@@ -27,17 +27,18 @@ use model::{lookup_piece_cost, CatalogPiece, ItemCostWeight, MetalType, Order, O
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum MainView {
     Orders,
+    History,
     Catalog,
     Listings,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// Open-board filters. Completed and archived orders live in [MainView::History].
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum ViewFilter {
     All,
     Shopify,
     Etsy,
     Urgent,
-    Archived,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -341,6 +342,20 @@ fn App() -> Element {
     let mut cf_lines = use_signal(Vec::<DraftLine>::new);
     let mut cf_due = use_signal(String::new);
     let mut cf_msg = use_signal(|| None::<String>);
+    let mut menu_open = use_signal(|| false);
+    let mut history = use_signal(Vec::<Order>::new);
+    let mut history_total = use_signal(|| 0usize);
+    let history_loading = use_signal(|| false);
+    let mut history_loaded = use_signal(|| false);
+    let mut history_error = use_signal(|| None::<String>);
+    let mut backfilling = use_signal(|| false);
+    // 0 = all time.
+    let mut history_days = use_signal(|| 90i64);
+    // The lowercased query the loaded history page was fetched with.
+    let history_query = use_signal(String::new);
+    // "" = every past order, else "completed" | "archived".
+    let mut history_state = use_signal(String::new);
+    let mut last_refresh = use_signal(|| None::<DateTime<Utc>>);
 
     use_effect(move || {
         spawn(async move {
@@ -363,10 +378,9 @@ fn App() -> Element {
                     for err in &result.errors {
                         log::app_log("ERROR", err.clone());
                     }
-                    if let Some(first_err) = result.errors.first() {
-                        error.set(Some(first_err.clone()));
-                    }
+                    error.set((!result.errors.is_empty()).then(|| result.errors.join(" | ")));
                     orders.set(result.orders);
+                    last_refresh.set(Some(Utc::now()));
                 }
                 Err(e) => {
                     log::app_log("ERROR", format!("Fetch failed: {}", e));
@@ -377,25 +391,21 @@ fn App() -> Element {
         });
     });
 
+    // No cap here, ever. Every open order that reached the client is listed.
     let filtered_orders = use_memo(move || {
+        let query = search_query.read().to_lowercase();
+        let vf = *view_filter.read();
         let mut result: Vec<Order> = orders
             .read()
             .iter()
-            .filter(|order| {
-                let passes_filter = match *view_filter.read() {
-                    ViewFilter::All => !order.archived,
-                    ViewFilter::Shopify => !order.archived && matches!(order.source, OrderSource::Shopify),
-                    ViewFilter::Etsy => !order.archived && matches!(order.source, OrderSource::Etsy),
-                    ViewFilter::Urgent => !order.archived && order.days_until_due() <= 3,
-                    ViewFilter::Archived => order.archived,
-                };
-                let query = search_query.read().to_lowercase();
-                let passes_search = query.is_empty()
-                    || order.customer_name.to_lowercase().contains(&query)
-                    || order.order_number.to_lowercase().contains(&query)
-                    || order.items.iter().any(|item| item.name.to_lowercase().contains(&query));
-                passes_filter && passes_search
+            .filter(|o| !o.archived && !o.completed)
+            .filter(|o| match vf {
+                ViewFilter::All => true,
+                ViewFilter::Shopify => matches!(o.source, OrderSource::Shopify),
+                ViewFilter::Etsy => matches!(o.source, OrderSource::Etsy),
+                ViewFilter::Urgent => o.days_until_due() <= 3,
             })
+            .filter(|o| order_matches(o, &query))
             .cloned()
             .collect();
         match *sort_by.read() {
@@ -408,12 +418,30 @@ fn App() -> Element {
 
     let stats = use_memo(move || {
         let all = orders.read();
-        let total = all.len();
-        let shopify = all.iter().filter(|o| matches!(o.source, OrderSource::Shopify)).count();
-        let etsy = all.iter().filter(|o| matches!(o.source, OrderSource::Etsy)).count();
-        let urgent = all.iter().filter(|o| o.days_until_due() <= 3).count();
-        let overdue = all.iter().filter(|o| o.days_until_due() < 0).count();
-        (total, shopify, etsy, urgent, overdue)
+        let open: Vec<&Order> = all.iter().filter(|o| !o.archived && !o.completed).collect();
+        OrderStats {
+            open: open.len(),
+            shopify: open.iter().filter(|o| matches!(o.source, OrderSource::Shopify)).count(),
+            etsy: open.iter().filter(|o| matches!(o.source, OrderSource::Etsy)).count(),
+            urgent: open.iter().filter(|o| o.days_until_due() <= 3).count(),
+            overdue: open.iter().filter(|o| o.days_until_due() < 0).count(),
+        }
+    });
+
+    let history_rows = use_memo(move || {
+        let typed = norm_query(&search_query.read());
+        // The server already applied the loaded page's query; re-filtering with it
+        // could only produce false negatives. Filter locally only while the typed
+        // query is ahead of what was fetched.
+        let stale = typed != *history_query.read();
+        history
+            .read()
+            .iter()
+            // An open order must never be reachable only from here.
+            .filter(|o| o.archived || o.completed)
+            .filter(|o| !stale || order_matches(o, &typed))
+            .cloned()
+            .collect::<Vec<Order>>()
     });
 
     // Total silver to buy: catalog weight for every open (non-archived, non-completed)
@@ -509,9 +537,61 @@ fn App() -> Element {
             .sum::<f64>()
     });
 
-    let silver_txt = format!("{:.0} g Ag to buy", silver_needed());
+    // max(0.0) so a -0.0 sum never renders as "-0 g".
+    let silver_txt = format!("{:.0} g Ag to buy", silver_needed().max(0.0));
+
+    let refresh_orders = use_callback(move |_: ()| {
+        loading.set(true);
+        error.set(None);
+        spawn(async move {
+            log::app_log("INFO", "Refresh: pulling live from Shopify + Etsy...");
+            match api::refresh_orders().await {
+                Ok(result) => {
+                    log::app_log("INFO", format!("Refresh done. {} open orders.", result.orders.len()));
+                    for err in &result.errors {
+                        log::app_log("ERROR", err.clone());
+                    }
+                    error.set((!result.errors.is_empty()).then(|| result.errors.join(" | ")));
+                    orders.set(result.orders);
+                    last_refresh.set(Some(Utc::now()));
+                }
+                Err(e) => {
+                    log::app_log("ERROR", format!("Refresh error: {}", e));
+                    error.set(Some(e.to_string()));
+                }
+            }
+            loading.set(false);
+        });
+    });
+
+    let reload_history = use_callback(move |_: ()| {
+        let days = *history_days.read();
+        let q = norm_query(&search_query.read());
+        let st = history_state.read().clone();
+        load_history(
+            days,
+            q,
+            st,
+            0,
+            false,
+            history,
+            history_total,
+            history_loading,
+            history_loaded,
+            history_error,
+            history_query,
+        );
+    });
+
+    let open_history = use_callback(move |_: ()| {
+        main_view.set(MainView::History);
+        if !*history_loaded.read() {
+            reload_history.call(());
+        }
+    });
 
     rsx! {
+        document::Meta { name: "viewport", content: "width=device-width, initial-scale=1" }
         document::Stylesheet { href: asset!("/assets/styles.css") }
         document::Stylesheet { href: asset!("/assets/dx-components-theme.css") }
         document::Stylesheet { href: asset!("/assets/dialog.css") }
@@ -528,19 +608,27 @@ fn App() -> Element {
                             span { class: "text-sm text-stardust", "Live" }
                         }
                         div { class: "nav-stats text-stardust text-sm flex items-center gap-4 flex-wrap",
-                            span { "{stats.read().0} orders" }
-                            span { "{stats.read().1} Shopify" }
-                            span { "{stats.read().2} Etsy" }
-                            span { "{stats.read().3} urgent" }
-                            span { "{stats.read().4} overdue" }
+                            span { "{stats.read().open} open" }
+                            span { "{stats.read().shopify} Shopify" }
+                            span { "{stats.read().etsy} Etsy" }
+                            span { "{stats.read().urgent} urgent" }
+                            span { "{stats.read().overdue} overdue" }
                             span { class: "text-comet-gold font-semibold", "{silver_txt}" }
+                            {(*last_refresh.read()).map(|t| rsx! {
+                                span { {format!("updated {}", ago(t))} }
+                            })}
                         }
                     }
-                    div { class: "flex items-center gap-3",
+                    div { class: "flex items-center gap-3 nav-actions",
                         FilterButton {
                             label: "Orders",
                             active: *main_view.read() == MainView::Orders,
                             onclick: move |_| main_view.set(MainView::Orders)
+                        }
+                        FilterButton {
+                            label: "History",
+                            active: *main_view.read() == MainView::History,
+                            onclick: move |_| open_history.call(())
                         }
                         FilterButton {
                             label: "Catalog",
@@ -559,31 +647,7 @@ fn App() -> Element {
                         }
                         button {
                             class: "btn-cosmic",
-                            onclick: move |_| {
-                                loading.set(true);
-                                error.set(None);
-                                spawn(async move {
-                                    log::app_log("INFO", "Refresh: pulling live from Shopify + Etsy...");
-                                    match api::refresh_orders().await {
-                                        Ok(result) => {
-                                            let total = result.orders.len();
-                                            log::app_log("INFO", format!("Refresh done. {} total orders.", total));
-                                            for err in &result.errors {
-                                                log::app_log("ERROR", err.clone());
-                                            }
-                                            if let Some(first_err) = result.errors.first() {
-                                                error.set(Some(first_err.clone()));
-                                            }
-                                            orders.set(result.orders);
-                                        }
-                                        Err(e) => {
-                                            log::app_log("ERROR", format!("Refresh error: {}", e));
-                                            error.set(Some(e.to_string()));
-                                        }
-                                    }
-                                    loading.set(false);
-                                });
-                            },
+                            onclick: move |_| refresh_orders.call(()),
                             "Refresh"
                         }
                         button {
@@ -602,6 +666,120 @@ fn App() -> Element {
                             },
                             "Logs"
                         }
+                        button {
+                            class: "mobile-nav-toggle",
+                            r#type: "button",
+                            aria_label: "Open menu",
+                            aria_haspopup: "dialog",
+                            aria_controls: "mobile-nav-panel",
+                            aria_expanded: if *menu_open.read() { "true" } else { "false" },
+                            onclick: move |_| menu_open.set(true),
+                            span { class: "hamburger-bar" }
+                            span { class: "hamburger-bar" }
+                            span { class: "hamburger-bar" }
+                        }
+                    }
+                }
+            }
+
+            div {
+                class: "mobile-nav-shell",
+                "data-open": if *menu_open.read() { "true" } else { "false" },
+
+                div { class: "mobile-nav-overlay", onclick: move |_| menu_open.set(false) }
+
+                div {
+                    class: "mobile-nav-panel",
+                    id: "mobile-nav-panel",
+                    role: "dialog",
+                    aria_modal: "true",
+                    aria_label: "Main menu",
+                    aria_hidden: (!*menu_open.read()).then_some("true"),
+                    inert: (!*menu_open.read()).then_some("true"),
+
+                    div { class: "mobile-nav-head",
+                        span { class: "mobile-nav-head-title", "Menu" }
+                        button {
+                            class: "mobile-nav-close", r#type: "button", aria_label: "Close menu",
+                            onclick: move |_| menu_open.set(false),
+                            "\u{00d7}"
+                        }
+                    }
+
+                    button {
+                        class: if *main_view.read() == MainView::Orders { "mobile-nav-item active" } else { "mobile-nav-item" },
+                        r#type: "button",
+                        onclick: move |_| { main_view.set(MainView::Orders); menu_open.set(false); },
+                        "Orders"
+                    }
+                    button {
+                        class: if *main_view.read() == MainView::History { "mobile-nav-item active" } else { "mobile-nav-item" },
+                        r#type: "button",
+                        onclick: move |_| { open_history.call(()); menu_open.set(false); },
+                        "History"
+                    }
+                    button {
+                        class: if *main_view.read() == MainView::Catalog { "mobile-nav-item active" } else { "mobile-nav-item" },
+                        r#type: "button",
+                        onclick: move |_| { main_view.set(MainView::Catalog); menu_open.set(false); },
+                        "Catalog"
+                    }
+                    button {
+                        class: if *main_view.read() == MainView::Listings { "mobile-nav-item active" } else { "mobile-nav-item" },
+                        r#type: "button",
+                        onclick: move |_| { main_view.set(MainView::Listings); menu_open.set(false); },
+                        "Listings"
+                    }
+
+                    hr { class: "mobile-nav-sep" }
+
+                    button {
+                        class: "mobile-nav-item is-primary", r#type: "button",
+                        onclick: move |_| { custom_open.set(true); cf_msg.set(None); menu_open.set(false); },
+                        "New order"
+                    }
+                    button {
+                        class: "mobile-nav-item", r#type: "button",
+                        disabled: *loading.read(),
+                        onclick: move |_| { refresh_orders.call(()); menu_open.set(false); },
+                        {if *loading.read() { "Refreshing..." } else { "Refresh" }}
+                    }
+                    button {
+                        class: "mobile-nav-item", r#type: "button",
+                        onclick: move |_| { settings_open.set(true); etsy_save_message.set(None); menu_open.set(false); },
+                        "Settings"
+                    }
+                    button {
+                        class: "mobile-nav-item", r#type: "button",
+                        onclick: move |_| { logs_open.set(true); log_snapshot.set(app_logs_snapshot()); menu_open.set(false); },
+                        "Logs"
+                    }
+
+                    div { class: "mobile-nav-stats",
+                        div {
+                            span { class: "mn-k", "Open" }
+                            span { class: "mn-v", "{stats.read().open}" }
+                        }
+                        div {
+                            span { class: "mn-k", "Shopify" }
+                            span { class: "mn-v", "{stats.read().shopify}" }
+                        }
+                        div {
+                            span { class: "mn-k", "Etsy" }
+                            span { class: "mn-v", "{stats.read().etsy}" }
+                        }
+                        div {
+                            span { class: "mn-k", "Urgent" }
+                            span { class: "mn-v", "{stats.read().urgent}" }
+                        }
+                        div {
+                            span { class: "mn-k", "Overdue" }
+                            span { class: "mn-v", "{stats.read().overdue}" }
+                        }
+                        div { class: "is-gold",
+                            span { class: "mn-k", "Silver to buy" }
+                            span { class: "mn-v", "{silver_txt}" }
+                        }
                     }
                 }
             }
@@ -609,9 +787,9 @@ fn App() -> Element {
             {if *settings_open.read() {
                 rsx! {
                     div {
-                        class: "fixed inset-0 z-50 flex items-center justify-center bg-black/60",
+                        class: "fixed inset-0 z-50 flex items-center justify-center bg-black/60 modal-overlay",
                         div {
-                            class: "card-cosmic p-6 max-w-lg w-full mx-4 max-h-[90vh] overflow-y-auto",
+                            class: "card-cosmic modal-card p-6 max-w-lg w-full mx-4 max-h-[90vh] overflow-y-auto",
                             onclick: move |evt| { evt.stop_propagation(); },
                             h2 { class: "text-xl font-bold text-star-white mb-4", "Settings" }
                             div { class: "space-y-4",
@@ -678,9 +856,9 @@ fn App() -> Element {
 
             {if *custom_open.read() {
                 rsx! {
-                    div { class: "fixed inset-0 z-50 flex items-center justify-center bg-black/60",
+                    div { class: "fixed inset-0 z-50 flex items-center justify-center bg-black/60 modal-overlay",
                         div {
-                            class: "card-cosmic p-6 max-w-lg w-full mx-4 max-h-[90vh] overflow-y-auto",
+                            class: "card-cosmic modal-card p-6 max-w-lg w-full mx-4 max-h-[90vh] overflow-y-auto",
                             onclick: move |evt| { evt.stop_propagation(); },
                             h2 { class: "text-xl font-bold text-star-white mb-4", "New order" }
                             div { class: "space-y-3",
@@ -908,11 +1086,44 @@ fn App() -> Element {
                                             log::app_log("ERROR", format!("Set order state: {}", e));
                                         }
                                     });
+                                    let now_past = archived || completed;
+                                    let from_history =
+                                        history.read().iter().find(|o| o.state_key() == key).cloned();
                                     {
                                         let mut os = orders.write();
-                                        if let Some(o) = os.iter_mut().find(|o| o.state_key() == key) {
-                                            o.archived = archived;
-                                            o.completed = completed;
+                                        match os.iter_mut().find(|o| o.state_key() == key) {
+                                            Some(o) => {
+                                                o.archived = archived;
+                                                o.completed = completed;
+                                            }
+                                            // Reopened from History: put it back on the board.
+                                            None => {
+                                                if let (false, Some(mut o)) = (now_past, from_history) {
+                                                    o.archived = false;
+                                                    o.completed = false;
+                                                    os.push(o);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    {
+                                        let mut h = history.write();
+                                        match h.iter().position(|o| o.state_key() == key) {
+                                            Some(pos) if now_past => {
+                                                h[pos].archived = archived;
+                                                h[pos].completed = completed;
+                                            }
+                                            Some(pos) => {
+                                                h.remove(pos);
+                                                let t = *history_total.read();
+                                                history_total.set(t.saturating_sub(1));
+                                            }
+                                            // Newly past: the loaded page is out of date.
+                                            None => {
+                                                if now_past {
+                                                    history_loaded.set(false);
+                                                }
+                                            }
                                         }
                                     }
                                     detail_order.set(None);
@@ -1009,8 +1220,8 @@ fn App() -> Element {
 
             div { class: if *main_view.read() == MainView::Orders { "container px-6 py-6" } else { "hidden" },
                 div { class: "card-cosmic p-6 mb-6",
-                    div { class: "flex flex-wrap items-center gap-4",
-                        div { class: "flex-1 min-w-0",
+                    div { class: "flex flex-wrap items-center gap-4 toolbar",
+                        div { class: "flex-1 min-w-0 toolbar-search",
                             input {
                                 r#type: "search",
                                 class: "w-full",
@@ -1019,9 +1230,9 @@ fn App() -> Element {
                                 oninput: move |evt| search_query.set(evt.value())
                             }
                         }
-                        div { class: "flex gap-2",
+                        div { class: "flex gap-2 filter-row",
                             FilterButton {
-                                label: "All",
+                                label: format!("All ({})", stats.read().open),
                                 active: *view_filter.read() == ViewFilter::All,
                                 onclick: move |_| view_filter.set(ViewFilter::All)
                             }
@@ -1041,12 +1252,12 @@ fn App() -> Element {
                                 onclick: move |_| view_filter.set(ViewFilter::Urgent)
                             }
                             FilterButton {
-                                label: "Archived",
-                                active: *view_filter.read() == ViewFilter::Archived,
-                                onclick: move |_| view_filter.set(ViewFilter::Archived)
+                                label: "Past orders",
+                                active: false,
+                                onclick: move |_| open_history.call(())
                             }
                         }
-                        div { class: "flex items-center gap-2",
+                        div { class: "flex items-center gap-2 sort-row",
                             span { class: "text-stardust text-sm", "Sort by:" }
                             select {
                                 class: "bg-nebula-dark border border-nebula-purple rounded-lg px-3 py-2",
@@ -1079,8 +1290,8 @@ fn App() -> Element {
                             p { class: "text-stardust mt-4", "No orders found" }
                         }
                     } else {
-                        div { class: "overflow-x-auto",
-                            table { class: "table-cosmic table-orders",
+                        div { class: "overflow-x-auto orders-scroll",
+                            table { class: "table-cosmic table-orders orders-table",
                                 thead {
                                     tr {
                                         th { class: "th-thumb", "" }
@@ -1109,6 +1320,17 @@ fn App() -> Element {
                                 }
                             }
                         }
+                        div { class: "table-footnote",
+                            span {
+                                {format!(
+                                    "Showing all {} orders in this view \u{00b7} {} open in total",
+                                    filtered_orders.read().len(), stats.read().open,
+                                )}
+                            }
+                            {(*last_refresh.read()).map(|t| rsx! {
+                                span { {format!("Last refreshed {}", ago(t))} }
+                            })}
+                        }
                     }
                 }
 
@@ -1124,6 +1346,199 @@ fn App() -> Element {
                     rsx! { }
                 }}
             }
+            {(*main_view.read() == MainView::History).then(|| {
+                let stale = norm_query(&search_query.read()) != *history_query.read();
+                let loaded_n = history.read().len();
+                let total_n = *history_total.read();
+                rsx! {
+                    div { class: "container px-6 py-6",
+                        div { class: "card-cosmic p-6 mb-6",
+                            div { class: "flex items-center justify-between flex-wrap gap-3 mb-4",
+                                h2 { class: "text-xl font-bold text-star-white", "Past orders" }
+                                span { class: "text-stardust text-sm",
+                                    "Completed, shipped and archived orders. Open orders stay on the Orders tab."
+                                }
+                            }
+                            div { class: "flex flex-wrap items-center gap-4 toolbar",
+                                div { class: "flex-1 min-w-0 toolbar-search",
+                                    input {
+                                        r#type: "search", class: "w-full",
+                                        placeholder: "Search past orders, customers, products...",
+                                        value: "{search_query}",
+                                        oninput: move |e| search_query.set(e.value())
+                                    }
+                                }
+                                div { class: "flex gap-2 filter-row",
+                                    FilterButton {
+                                        label: "30 days",
+                                        disabled: *history_loading.read(),
+                                        active: *history_days.read() == 30,
+                                        onclick: move |_| { history_days.set(30); reload_history.call(()); }
+                                    }
+                                    FilterButton {
+                                        label: "90 days",
+                                        disabled: *history_loading.read(),
+                                        active: *history_days.read() == 90,
+                                        onclick: move |_| { history_days.set(90); reload_history.call(()); }
+                                    }
+                                    FilterButton {
+                                        label: "1 year",
+                                        disabled: *history_loading.read(),
+                                        active: *history_days.read() == 365,
+                                        onclick: move |_| { history_days.set(365); reload_history.call(()); }
+                                    }
+                                    FilterButton {
+                                        label: "All time",
+                                        disabled: *history_loading.read(),
+                                        active: *history_days.read() == 0,
+                                        onclick: move |_| { history_days.set(0); reload_history.call(()); }
+                                    }
+                                }
+                                div { class: "flex gap-2 filter-row",
+                                    FilterButton {
+                                        label: "All",
+                                        disabled: *history_loading.read(),
+                                        active: history_state.read().is_empty(),
+                                        onclick: move |_| { history_state.set(String::new()); reload_history.call(()); }
+                                    }
+                                    FilterButton {
+                                        label: "Completed",
+                                        disabled: *history_loading.read(),
+                                        active: *history_state.read() == "completed",
+                                        onclick: move |_| { history_state.set("completed".to_string()); reload_history.call(()); }
+                                    }
+                                    FilterButton {
+                                        label: "Archived",
+                                        disabled: *history_loading.read(),
+                                        active: *history_state.read() == "archived",
+                                        onclick: move |_| { history_state.set("archived".to_string()); reload_history.call(()); }
+                                    }
+                                }
+                                div { class: "flex gap-2 toolbar-actions",
+                                    button {
+                                        class: if stale { "btn-nebula" } else { "btn-cosmic" },
+                                        disabled: *history_loading.read(),
+                                        onclick: move |_| reload_history.call(()),
+                                        {if *history_loading.read() { "Searching..." } else { "Search all history" }}
+                                    }
+                                    button {
+                                        class: "btn-cosmic",
+                                        disabled: *backfilling.read(),
+                                        title: "Pull every past order from Shopify and Etsy into the archive. Slow; run once.",
+                                        onclick: move |_| {
+                                            if *backfilling.read() { return; }
+                                            backfilling.set(true);
+                                            spawn(async move {
+                                                log::app_log("INFO", "Backfill: pulling all history from Shopify + Etsy...");
+                                                match api::backfill_order_history().await {
+                                                    Ok(r) => {
+                                                        log::app_log("INFO", format!("Backfill: archived {} orders.", r.fetched));
+                                                        for e in &r.errors {
+                                                            log::app_log("ERROR", e.clone());
+                                                        }
+                                                        history_error.set((!r.errors.is_empty()).then(|| r.errors.join(" | ")));
+                                                    }
+                                                    Err(e) => {
+                                                        log::app_log("ERROR", format!("Backfill: {}", e));
+                                                        history_error.set(Some(e.to_string()));
+                                                    }
+                                                }
+                                                backfilling.set(false);
+                                                history_loaded.set(false);
+                                                reload_history.call(());
+                                            });
+                                        },
+                                        {if *backfilling.read() { "Backfilling..." } else { "Backfill all history" }}
+                                    }
+                                }
+                            }
+                        }
+
+                        {history_error.read().as_ref().map(|e| rsx! {
+                            div { class: "card-cosmic p-4 mb-6 border-warning-red",
+                                p { class: "text-warning-red text-sm", "{e}" }
+                            }
+                        })}
+
+                        div { class: "card-cosmic overflow-hidden",
+                            if *history_loading.read() && loaded_n == 0 {
+                                div { class: "p-8 text-center",
+                                    p { class: "text-stardust", "Loading past orders..." }
+                                }
+                            } else if history_rows.read().is_empty() {
+                                div { class: "p-8 text-center",
+                                    p { class: "text-stardust",
+                                        "No past orders in this range yet. Widen the range, or run \"Backfill all history\" once to pull everything Shopify and Etsy still have."
+                                    }
+                                }
+                            } else {
+                                div { class: "overflow-x-auto history-scroll",
+                                    table { class: "table-cosmic table-orders history-table",
+                                        thead {
+                                            tr {
+                                                th { class: "th-thumb", "" }
+                                                th { "Order" }
+                                                th { "Customer" }
+                                                th { class: "th-items", "Items" }
+                                                th { class: "col-total", "Total" }
+                                                th { class: "col-cost", title: "Our cost (from catalog)", "Cost" }
+                                                th { class: "col-margin", title: "Sale price minus our cost", "Margin" }
+                                                th { "Status" }
+                                                th { "Source" }
+                                            }
+                                        }
+                                        tbody {
+                                            for past in history_rows.read().clone() {
+                                                HistoryRow {
+                                                    key: "{past.state_key()}",
+                                                    order: past.clone(),
+                                                    catalog: catalog.read().clone(),
+                                                    on_click: move |_| detail_order.set(Some(past.clone())),
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            div { class: "table-footnote",
+                                span { {format!("Showing {} of {} past orders", history_rows.read().len(), total_n)} }
+                                {stale.then(|| rsx! {
+                                    span { class: "text-comet-gold",
+                                        "Filtered from the loaded page \u{2014} press Search all history to cover every past order."
+                                    }
+                                })}
+                                {(!stale && loaded_n < total_n).then(|| rsx! {
+                                    button {
+                                        class: "btn-cosmic text-sm",
+                                        disabled: *history_loading.read(),
+                                        onclick: move |_| {
+                                            // Bind first: load_history writes history_query, so a
+                                            // live read guard on it here would panic.
+                                            let days = *history_days.read();
+                                            let q = history_query.read().clone();
+                                            let st = history_state.read().clone();
+                                            load_history(
+                                                days,
+                                                q,
+                                                st,
+                                                loaded_n as u32,
+                                                true,
+                                                history,
+                                                history_total,
+                                                history_loading,
+                                                history_loaded,
+                                                history_error,
+                                                history_query,
+                                            );
+                                        },
+                                        {format!("Show {} more", (total_n - loaded_n).min(HISTORY_PAGE as usize))}
+                                    }
+                                })}
+                            }
+                        }
+                    }
+                }
+            })}
             div { class: if *main_view.read() == MainView::Catalog { "container px-6 py-6" } else { "hidden" },
                 CatalogView { catalog: catalog.read().clone() }
             }
@@ -1132,6 +1547,89 @@ fn App() -> Element {
             }
         }
     }
+}
+
+/// Past orders fetched per history page.
+const HISTORY_PAGE: u32 = 100;
+
+/// Nav-bar counts over the open board only; past orders are counted server-side.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct OrderStats {
+    open: usize,
+    shopify: usize,
+    etsy: usize,
+    urgent: usize,
+    overdue: usize,
+}
+
+/// The single normalization both the client filter and the server query use, so
+/// a trailing space can never make them disagree.
+fn norm_query(s: &str) -> String {
+    s.trim().to_lowercase()
+}
+
+/// Match an already-normalized query against order number, customer, item names.
+fn order_matches(order: &Order, query: &str) -> bool {
+    query.is_empty()
+        || order.customer_name.to_lowercase().contains(query)
+        || order.order_number.to_lowercase().contains(query)
+        || order.items.iter().any(|i| i.name.to_lowercase().contains(query))
+}
+
+/// Relative age of a timestamp, falling back to a date past one day.
+fn ago(t: DateTime<Utc>) -> String {
+    let mins = (Utc::now() - t).num_minutes();
+    if mins < 1 {
+        "just now".to_string()
+    } else if mins < 60 {
+        format!("{} min ago", mins)
+    } else if mins < 24 * 60 {
+        format!("{} h ago", mins / 60)
+    } else {
+        t.format("%b %d").to_string()
+    }
+}
+
+/// Fetch one page of history into `history`; `append` keeps rows already loaded.
+#[allow(clippy::too_many_arguments)]
+fn load_history(
+    days: i64,
+    query: String,
+    state: String,
+    offset: u32,
+    append: bool,
+    mut history: Signal<Vec<Order>>,
+    mut total: Signal<usize>,
+    mut loading: Signal<bool>,
+    mut loaded: Signal<bool>,
+    mut error: Signal<Option<String>>,
+    mut last_query: Signal<String>,
+) {
+    if *loading.read() {
+        return;
+    }
+    loading.set(true);
+    error.set(None);
+    last_query.set(query.clone());
+    spawn(async move {
+        match api::fetch_order_history(days, query, String::new(), state, HISTORY_PAGE, offset).await {
+            Ok(page) => {
+                log::app_log("INFO", format!("History: {} rows of {}.", page.orders.len(), page.total));
+                total.set(page.total);
+                if append {
+                    history.write().extend(page.orders);
+                } else {
+                    history.set(page.orders);
+                }
+                loaded.set(true);
+            }
+            Err(e) => {
+                log::app_log("ERROR", format!("History load: {}", e));
+                error.set(Some(e.to_string()));
+            }
+        }
+        loading.set(false);
+    });
 }
 
 fn ring_num(s: &Option<String>) -> f64 {
@@ -1327,8 +1825,8 @@ fn CatalogView(catalog: Vec<CatalogPiece>) -> Element {
                 h2 { class: "text-xl font-bold text-star-white", "Catalog" }
                 span { class: "text-stardust text-sm", "{shown} of {total_pieces} pieces \u{00b7} {total_rows} cost rows" }
             }
-            div { class: "flex flex-wrap items-center gap-4",
-                div { class: "flex-1 min-w-0",
+            div { class: "flex flex-wrap items-center gap-4 toolbar",
+                div { class: "flex-1 min-w-0 toolbar-search",
                     input {
                         r#type: "search", class: "w-full",
                         placeholder: "Search catalog...",
@@ -1336,7 +1834,7 @@ fn CatalogView(catalog: Vec<CatalogPiece>) -> Element {
                         oninput: move |e| search.set(e.value())
                     }
                 }
-                div { class: "flex gap-2",
+                div { class: "flex gap-2 filter-row",
                     FilterButton {
                         label: "All",
                         active: *kind_filter.read() == CatalogKind::All,
@@ -1353,7 +1851,7 @@ fn CatalogView(catalog: Vec<CatalogPiece>) -> Element {
                         onclick: move |_| kind_filter.set(CatalogKind::Pendant)
                     }
                 }
-                div { class: "flex items-center gap-2",
+                div { class: "flex items-center gap-2 sort-row",
                     span { class: "text-stardust text-sm", "Sort:" }
                     select {
                         class: "bg-nebula-dark border border-nebula-purple rounded-lg px-3 py-2",
@@ -1452,8 +1950,8 @@ fn CatalogPieceCard(piece: CatalogPiece) -> Element {
                 {(!sale_str.is_empty()).then(|| rsx! { span { class: "text-comet-gold text-sm", "{sale_str}" } })}
                 {(!margin_str.is_empty()).then(|| rsx! { span { class: "{margin_class}", "{margin_str}" } })}
             }
-            div { class: "overflow-x-auto",
-                table { class: "table-cosmic table-orders",
+            div { class: "overflow-x-auto catalog-scroll",
+                table { class: "table-cosmic table-orders catalog-table",
                     thead {
                         tr {
                             th { "Size" }
@@ -1592,24 +2090,24 @@ fn ListingsView(catalog: Signal<Vec<CatalogPiece>>) -> Element {
         div { class: "card-cosmic p-6 mb-6",
             div { class: "flex items-center justify-between flex-wrap gap-3 mb-4",
                 h2 { class: "text-xl font-bold text-star-white", "Listings" }
-                div { class: "flex gap-2",
+                div { class: "flex gap-2 filter-row",
                     FilterButton { label: format!("To link ({tolink_count})"), active: *view.read() == "tolink", onclick: move |_| view.set("tolink".to_string()) }
                     FilterButton { label: format!("Linked ({linked_count})"), active: *view.read() == "linked", onclick: move |_| view.set("linked".to_string()) }
                 }
             }
-            div { class: "flex flex-wrap items-center gap-4",
-                div { class: "flex-1 min-w-0",
+            div { class: "flex flex-wrap items-center gap-4 toolbar",
+                div { class: "flex-1 min-w-0 toolbar-search",
                     input {
                         r#type: "search", class: "w-full", placeholder: "Search listings...",
                         value: "{search}", oninput: move |e| search.set(e.value())
                     }
                 }
-                div { class: "flex gap-2",
+                div { class: "flex gap-2 filter-row",
                     FilterButton { label: "All", active: *source_filter.read() == "all", onclick: move |_| source_filter.set("all".to_string()) }
                     FilterButton { label: "Shopify", active: *source_filter.read() == "shopify", onclick: move |_| source_filter.set("shopify".to_string()) }
                     FilterButton { label: "Etsy", active: *source_filter.read() == "etsy", onclick: move |_| source_filter.set("etsy".to_string()) }
                 }
-                div { class: "flex gap-2",
+                div { class: "flex gap-2 toolbar-actions",
                     button {
                         class: "btn-nebula", disabled: pulling.read().is_some(),
                         onclick: move |_| pull_listings("shopify", listings, pulling, errors, pulled),
@@ -1671,8 +2169,8 @@ fn ListingsView(catalog: Signal<Vec<CatalogPiece>>) -> Element {
             } else {
                 rsx! {
                     div { class: "card-cosmic overflow-hidden",
-                        div { class: "overflow-x-auto",
-                            table { class: "table-cosmic table-orders",
+                        div { class: "overflow-x-auto listings-scroll",
+                            table { class: "table-cosmic table-orders listings-table",
                                 thead {
                                     tr {
                                         th { class: "th-thumb", "" }
@@ -1785,11 +2283,17 @@ fn ListingRow(
 }
 
 #[component]
-fn FilterButton(label: String, active: bool, onclick: EventHandler<MouseEvent>) -> Element {
+fn FilterButton(
+    label: String,
+    active: bool,
+    onclick: EventHandler<MouseEvent>,
+    #[props(default = false)] disabled: bool,
+) -> Element {
     let class = if active { "btn-nebula" } else { "btn-cosmic" };
     rsx! {
         button {
             class: "{class}",
+            disabled,
             onclick: move |evt| onclick.call(evt),
             "{label}"
         }
@@ -1880,7 +2384,7 @@ fn OrderRow(
                     None => rsx! { span { class: "order-thumb-placeholder", "pkg" } },
                 }}
             }
-            td { class: "td-nowrap",
+            td { class: "td-nowrap td-order",
                 div { class: "font-semibold text-star-white", "{order.order_number}" }
                 div { class: "text-xs text-stardust",
                     "{order.order_date.format(\"%b %d, %Y\")}"
@@ -1889,7 +2393,7 @@ fn OrderRow(
                     span { class: "badge badge-stage", "{s}" }
                 })}
             }
-            td { class: "td-nowrap text-moonlight", title: "{order.customer_name}",
+            td { class: "td-nowrap text-moonlight td-customer", title: "{order.customer_name}",
                 span { class: "cell-truncate", "{order.customer_name}" }
             }
             td { class: "td-items", title: "{items_tooltip}",
@@ -1903,7 +2407,7 @@ fn OrderRow(
                     }
                 }
             }
-            td { class: "td-nowrap",
+            td { class: "td-nowrap", "data-label": "Metal",
                 {
                     let badge_class = format!("badge {}", primary_metal.display_class());
                     let metal_name = primary_metal.display_name();
@@ -1912,13 +2416,13 @@ fn OrderRow(
                     }
                 }
             }
-            td { class: "td-nowrap",
+            td { class: "td-nowrap", "data-label": "Size",
                 span { class: "font-mono text-aurora-purple", "{ring_size}" }
             }
-            td { class: "td-nowrap text-moonlight",
+            td { class: "td-nowrap text-moonlight", "data-label": "Due",
                 "{order.due_date.format(\"%b %d\")}"
             }
-            td { class: "td-nowrap",
+            td { class: "td-nowrap", "data-label": "Days left",
                 {
                     let text_color = match urgency_class {
                         "urgency-overdue" => "font-bold text-warning-red",
@@ -1931,13 +2435,13 @@ fn OrderRow(
                     }
                 }
             }
-            td { class: "td-nowrap font-semibold col-total",
+            td { class: "td-nowrap font-semibold col-total", "data-label": "Total",
                 {format!("$ {:.2}", order.total_price)}
             }
-            td { class: "td-nowrap col-cost", title: "Our cost (from catalog)", "{cost_str}" }
-            td { class: "{margin_class} col-margin", title: "Sale price minus our cost", "{margin_str}" }
-            td { class: "td-nowrap text-stardust", title: "Weight (g)", "{weight_str}" }
-            td { class: "td-nowrap",
+            td { class: "td-nowrap col-cost", "data-label": "Cost", title: "Our cost (from catalog)", "{cost_str}" }
+            td { class: "{margin_class} col-margin", "data-label": "Margin", title: "Sale price minus our cost", "{margin_str}" }
+            td { class: "td-nowrap text-stardust", "data-label": "Weight", title: "Weight (g)", "{weight_str}" }
+            td { class: "td-nowrap td-source",
                 {
                     let source_class = format!("badge {}", source_badge.1);
                     let source_name = source_badge.0;
@@ -1945,6 +2449,99 @@ fn OrderRow(
                         span { class: "{source_class}", "{source_name}" }
                     }
                 }
+            }
+        }
+    }
+}
+
+#[component]
+fn HistoryRow(
+    order: Order,
+    catalog: Vec<CatalogPiece>,
+    on_click: EventHandler<MouseEvent>,
+) -> Element {
+    let source_badge = match order.source {
+        OrderSource::Shopify => ("Shopify", "badge-method"),
+        OrderSource::Etsy => ("Etsy", "badge-nebula"),
+        OrderSource::Custom => ("Custom", "badge-success"),
+    };
+    let (state_label, state_badge) = if order.archived {
+        ("Archived", "badge-nebula")
+    } else {
+        ("Completed", "badge-success")
+    };
+    let items_display: Vec<String> = order
+        .items
+        .iter()
+        .map(|i| {
+            if i.quantity > 1 {
+                format!("{}x {}", i.quantity, i.name)
+            } else {
+                i.name.clone()
+            }
+        })
+        .collect();
+    let items_tooltip = items_display.join("\n");
+    let first_image = order.items.first().and_then(|i| i.image_url.clone());
+
+    let order_cost = order.items.iter().fold(0.0_f64, |c, item| {
+        c + lookup_piece_cost(item, &catalog)
+            .as_ref()
+            .map(|x| x.cost_usd * item.quantity as f64)
+            .unwrap_or(0.0)
+    });
+    let cost_str = if order_cost > 0.0 {
+        format!("$ {:.2}", order_cost)
+    } else {
+        "\u{2014}".to_string()
+    };
+    let (margin_str, margin_class) = if order_cost > 0.0 && order.total_price > 0.0 {
+        let margin = order.total_price - order_cost;
+        let pct = margin / order.total_price * 100.0;
+        let color = if margin < 0.0 { "text-warning-red" } else { "text-alien-green" };
+        (format!("$ {:.2} ({:.0}%)", margin, pct), format!("td-nowrap font-semibold {color}"))
+    } else {
+        ("\u{2014}".to_string(), "td-nowrap text-stardust".to_string())
+    };
+
+    rsx! {
+        tr {
+            class: "urgency-ok order-row-clickable",
+            onclick: move |evt| on_click.call(evt),
+            td { class: "td-thumb",
+                {match first_image.as_deref() {
+                    Some(url) => rsx! { img { class: "order-thumb", src: "{url}", alt: "" } },
+                    None => rsx! { span { class: "order-thumb-placeholder", "pkg" } },
+                }}
+            }
+            td { class: "td-nowrap td-order",
+                div { class: "font-semibold text-star-white", "{order.order_number}" }
+                div { class: "text-xs text-stardust", "{order.order_date.format(\"%b %d, %Y\")}" }
+            }
+            td { class: "td-nowrap text-moonlight td-customer", title: "{order.customer_name}",
+                span { class: "cell-truncate", "{order.customer_name}" }
+            }
+            td { class: "td-items", title: "{items_tooltip}",
+                div { class: "items-cell cell-truncate",
+                    for (idx, item) in items_display.iter().enumerate() {
+                        div {
+                            class: "text-sm",
+                            class: if idx > 0 { "text-stardust" } else { "text-star-white" },
+                            "{item}"
+                        }
+                    }
+                }
+            }
+            td { class: "td-nowrap font-semibold col-total", "data-label": "Total",
+                {format!("$ {:.2}", order.total_price)}
+            }
+            td { class: "td-nowrap col-cost", "data-label": "Cost", title: "Our cost (from catalog)", "{cost_str}" }
+            td { class: "{margin_class} col-margin", "data-label": "Margin", title: "Sale price minus our cost", "{margin_str}" }
+            td { class: "td-nowrap", "data-label": "Status",
+                span { class: "badge {state_badge}", "{state_label}" }
+            }
+            td { class: "td-nowrap td-source",
+                span { class: "badge {source_badge.1}", "{source_badge.0}" }
             }
         }
     }

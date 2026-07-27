@@ -661,3 +661,559 @@ select option { background-color: var(--surface); }
 @media (min-width: 768px) {
   .md\:flex-row { flex-direction: row; }
 }
+
+/* ══════════════════════════ MOBILE LAYER ══════════════════════════
+   Breakpoint 900px. Everything below this banner is mobile-only and
+   must stay last in the file — several rules resolve specificity ties
+   with the utility classes above by source order.
+   ═════════════════════════════════════════════════════════════════ */
+
+/* The only two declarations outside the media query. */
+.mobile-nav-toggle { display: none; }
+.mobile-nav-shell { display: none; }
+
+/* Row-count + last-refresh line under a table; styled at both breakpoints. */
+.table-footnote {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  padding: 0.7rem 1rem;
+  border-top: 1px solid var(--hairline);
+  color: var(--text-dim);
+  font-size: 0.8rem;
+}
+
+@media (max-width: 900px) {
+
+  /* ── Page chrome ──────────────────────────────────────────────── */
+
+  /* clip, not hidden: leaves the viewport as the scroll container. */
+  body { overflow-x: clip; overflow-wrap: break-word; }
+
+  .px-6 { padding-left: 0.85rem; padding-right: 0.85rem; }
+  .py-6 { padding-top: 0.85rem; padding-bottom: 0.85rem; }
+  .p-4 { padding: 0.8rem; }
+  .p-6 { padding: 0.9rem; }
+  .p-8 { padding: 1.25rem; }
+  .mb-6 { margin-bottom: 0.85rem; }
+  .gap-4 { gap: 0.7rem; }
+  .text-2xl { font-size: 1.25rem; }
+  .text-3xl { font-size: 1.45rem; }
+  .text-4xl { font-size: 1.75rem; }
+  .stat-value { font-size: 1.6rem; }
+  .card-cosmic { border-radius: 14px; }
+
+  /* Neutralizes :hover, which sticks after a tap on touch. */
+  .card-cosmic:hover { border-color: var(--hairline); box-shadow: var(--shadow-deep); }
+  .btn-nebula:hover { transform: none; filter: none; box-shadow: 0 4px 18px rgba(139, 92, 246, 0.35); }
+  .btn-cosmic:hover { background: rgba(139, 92, 246, 0.08); border-color: var(--hairline-2); box-shadow: none; }
+  .btn-danger:hover { transform: none; box-shadow: none; }
+  .catalog-summary:hover { background: transparent; }
+  .product-option:hover { background: transparent; }
+
+  /* ── Tap targets & form controls ──────────────────────────────── */
+
+  button { min-height: 44px; }
+
+  .btn-nebula, .btn-cosmic, .btn-danger {
+    min-height: 44px;
+    padding: 0.7rem 1rem;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  /* 16px minimum — iOS Safari zooms the page on focus below it. */
+  input[type="text"],
+  input[type="search"],
+  input[type="number"],
+  input[type="date"],
+  input[type="email"],
+  input[type="tel"],
+  input[type="password"],
+  input:not([type]),
+  textarea,
+  select {
+    font-size: 16px;
+    min-height: 44px;
+    padding: 0.55rem 0.75rem;
+  }
+  textarea { min-height: 96px; }
+  /* 0,1,1 so a .text-sm / .text-xs utility on a field cannot drop it under 16px. */
+  input.text-sm, textarea.text-sm, select.text-sm,
+  input.text-xs, textarea.text-xs, select.text-xs { font-size: 16px; }
+
+  /* ── Nav ──────────────────────────────────────────────────────── */
+
+  .nav-galaxy { padding: 0.5rem 0.85rem; }
+  .nav-galaxy h1 { font-size: 1.05rem; }
+  .nav-galaxy .container { flex-wrap: nowrap; gap: 0.5rem; }
+  .nav-galaxy .container > .flex.items-center.gap-4 { min-width: 0; gap: 0.5rem; }
+
+  /* Hides the nav stat strip unless it is the drawer's own copy. */
+  .nav-galaxy .nav-stats:not(.mobile-nav-stats) { display: none; }
+
+  /* Desktop button row collapses, but never the hamburger inside it. */
+  .nav-actions > *:not(.mobile-nav-toggle),
+  .nav-galaxy .container > .flex.items-center.gap-3 > *:not(.mobile-nav-toggle) { display: none; }
+  .nav-actions { gap: 0; }
+
+  /* ── Hamburger ────────────────────────────────────────────────── */
+
+  .mobile-nav-toggle {
+    display: inline-flex;
+    flex: 0 0 auto;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+    width: 44px;
+    height: 44px;
+    padding: 0;
+    background: rgba(139, 92, 246, 0.10);
+    border: 1px solid var(--hairline-2);
+    border-radius: 11px;
+    color: var(--text);
+    font-size: 1.15rem;
+    line-height: 1;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .mobile-nav-toggle:active { background: rgba(139, 92, 246, 0.24); }
+  .mobile-nav-toggle .hamburger-bar {
+    display: block;
+    width: 20px;
+    height: 2px;
+    border-radius: 2px;
+    background: currentColor;
+  }
+
+  /* ── Drawer ───────────────────────────────────────────────────── */
+
+  /* Fixed shell clips the absolutely positioned panel when off-screen. */
+  .mobile-nav-shell {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 45;
+    overflow: hidden;
+    pointer-events: auto;
+  }
+  .mobile-nav-shell[data-open="false"] { pointer-events: none; }
+
+  .mobile-nav-backdrop,
+  .mobile-nav-overlay {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.62);
+    opacity: 1;
+    animation: mobile-nav-fade 0.2s ease;
+    transition: opacity 0.22s ease;
+    touch-action: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .mobile-nav-shell[data-open="false"] .mobile-nav-backdrop,
+  .mobile-nav-shell[data-open="false"] .mobile-nav-overlay { opacity: 0; animation: none; }
+
+  /* Percentage width, not vw: sized against the shell, not the window. */
+  .mobile-nav-drawer,
+  .mobile-nav-panel {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+    width: min(84%, 20rem);
+    padding: 0.85rem 0.85rem 1.1rem;
+    padding-bottom: calc(1.1rem + env(safe-area-inset-bottom));
+    background: linear-gradient(160deg, #120e22 0%, #0a0812 100%);
+    border-left: 1px solid var(--hairline-2);
+    box-shadow: -18px 0 50px rgba(0, 0, 0, 0.65);
+    transform: translateX(0);
+    animation: mobile-nav-slide 0.24s cubic-bezier(0.22, 0.61, 0.36, 1);
+    transition: transform 0.24s cubic-bezier(0.22, 0.61, 0.36, 1);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+  .mobile-nav-shell[data-open="false"] .mobile-nav-drawer,
+  .mobile-nav-shell[data-open="false"] .mobile-nav-panel { transform: translateX(100%); animation: none; }
+
+  /* Entry animation covers a shell that is mounted already open. */
+  @keyframes mobile-nav-fade { from { opacity: 0; } }
+  @keyframes mobile-nav-slide { from { transform: translateX(100%); } }
+
+  .mobile-nav-title,
+  .mobile-nav-head-title {
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--text-faint);
+  }
+  .mobile-nav-title { padding-bottom: 0.5rem; border-bottom: 1px solid var(--hairline); }
+
+  .mobile-nav-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid var(--hairline);
+  }
+  .mobile-nav-close {
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: center;
+    width: 44px;
+    height: 44px;
+    background: rgba(139, 92, 246, 0.12);
+    border: 1px solid var(--hairline-2);
+    border-radius: 11px;
+    color: var(--text);
+    font-size: 1.3rem;
+    line-height: 1;
+    cursor: pointer;
+  }
+
+  .mobile-nav-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.6rem;
+    width: 100%;
+    min-height: 48px;
+    padding: 0.65rem 0.8rem;
+    background: rgba(139, 92, 246, 0.06);
+    border: 1px solid var(--hairline);
+    border-radius: 12px;
+    color: var(--text);
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 0.95rem;
+    font-weight: 500;
+    text-align: left;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .mobile-nav-item:active { background: rgba(139, 92, 246, 0.2); }
+  .mobile-nav-item:disabled { opacity: 0.55; cursor: not-allowed; }
+  .mobile-nav-item.active,
+  .mobile-nav-item.is-primary,
+  .mobile-nav-item[aria-current="page"] {
+    background: var(--grad-brand);
+    border-color: transparent;
+    color: #fff;
+    font-weight: 600;
+    box-shadow: 0 4px 18px rgba(139, 92, 246, 0.35);
+  }
+
+  .mobile-nav-sep { height: 1px; margin: 0.3rem 0; border: 0; background: var(--hairline); }
+
+  .mobile-nav-stats {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.4rem;
+    margin-top: 0.3rem;
+    padding-top: 0.6rem;
+    border-top: 1px solid var(--hairline);
+  }
+  .mobile-nav-stats > * {
+    min-width: 0;
+    padding: 0.45rem 0.55rem;
+    background: rgba(139, 92, 246, 0.06);
+    border: 1px solid var(--hairline);
+    border-radius: 10px;
+    font-size: 0.8rem;
+    overflow-wrap: anywhere;
+  }
+  .mobile-nav-stats > .is-gold,
+  .mobile-nav-stats > .text-comet-gold { grid-column: 1 / -1; }
+  .mobile-nav-stats .mn-k {
+    display: block;
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 0.58rem;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--text-faint);
+  }
+  .mobile-nav-stats .mn-v {
+    display: block;
+    font-size: 1rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: var(--text);
+  }
+  .mobile-nav-stats > .is-gold .mn-v { font-size: 0.9rem; color: var(--gold); }
+
+  /* ── Toolbars & filter rows ───────────────────────────────────── */
+
+  .toolbar,
+  .card-cosmic > .flex.flex-wrap.items-center.gap-4 { gap: 0.6rem; }
+  .toolbar > *,
+  .card-cosmic > .flex.flex-wrap.items-center.gap-4 > * { flex: 1 1 100%; min-width: 0; }
+
+  .flex.gap-2,
+  .filter-row,
+  .sort-row,
+  .toolbar-actions { flex-wrap: wrap; }
+  .filter-row > *,
+  .toolbar-actions > * { flex: 1 1 auto; }
+  .sort-row select { flex: 1 1 auto; width: auto; min-width: 0; }
+
+  /* ── Catalog & listings keep scrolling as tables ──────────────── */
+
+  .overflow-x-auto { overscroll-behavior-x: contain; -webkit-overflow-scrolling: touch; }
+  .catalog-table, .listings-table { font-size: 0.8rem; }
+  .catalog-table td, .catalog-table th,
+  .listings-table td, .listings-table th { padding: 0.5rem 0.55rem; }
+
+  .catalog-summary { flex-wrap: wrap; gap: 0.35rem 0.5rem; min-height: 48px; padding: 0.7rem 0.75rem; }
+  .catalog-summary > .font-semibold { flex: 1 1 8rem; min-width: 0; overflow-wrap: anywhere; }
+  .catalog-range { margin-left: 0; }
+  .catalog-group-title { flex-wrap: wrap; gap: 0.35rem; padding: 0.6rem 0.75rem; }
+
+  /* ── Orders & history tables become stacked cards ─────────────── */
+  /* Never .table-orders: the catalog and listings tables share it. */
+
+  .orders-scroll, .history-scroll { overflow-x: visible; padding: 0.6rem; }
+
+  .orders-table, .history-table { display: block; width: 100%; font-size: 0.85rem; }
+  .orders-table thead, .history-table thead { display: none; }
+  .orders-table tbody, .history-table tbody { display: block; }
+
+  .orders-table tbody tr,
+  .history-table tbody tr {
+    position: relative;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    column-gap: 0.7rem;
+    row-gap: 0.35rem;
+    padding: 0.8rem;
+    border: 1px solid var(--hairline);
+    border-radius: 12px;
+    margin-bottom: 0.6rem;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .orders-table tbody tr:last-child,
+  .history-table tbody tr:last-child { margin-bottom: 0; }
+
+  /* 0,1,2 beats .table-cosmic td. */
+  .orders-table tbody td,
+  .history-table tbody td {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.15rem 0.6rem;
+    min-width: 0;
+    padding: 0;
+    border-bottom: none;
+    vertical-align: baseline;
+  }
+
+  /* 0,2,2 beats .table-orders .td-nowrap. */
+  .orders-table tbody td[data-label],
+  .history-table tbody td[data-label] { white-space: normal; overflow-wrap: anywhere; }
+
+  .orders-table tbody td[data-label]::before,
+  .history-table tbody td[data-label]::before {
+    content: attr(data-label);
+    flex: 0 0 auto;
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 0.6rem;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    line-height: 1.6;
+    text-transform: uppercase;
+    color: var(--text-faint);
+  }
+
+  /* Out of grid flow, pinned to the card's top-left as its image. */
+  .orders-table td.td-thumb,
+  .history-table td.td-thumb {
+    position: absolute;
+    top: 0.8rem;
+    left: 0.8rem;
+    display: block;
+    width: 2.5rem;
+    padding: 0;
+  }
+
+  /* Card header + footer cells span both stat columns. */
+  .orders-table td.td-order,
+  .orders-table td.td-customer,
+  .orders-table td.td-items,
+  .orders-table td.td-source,
+  .orders-table td[data-label="Order"],
+  .orders-table td[data-label="Customer"],
+  .orders-table td[data-label="Items"],
+  .orders-table td[data-label="Source"],
+  .history-table td.td-order,
+  .history-table td.td-customer,
+  .history-table td.td-items,
+  .history-table td.td-source,
+  .history-table td[data-label="Order"],
+  .history-table td[data-label="Customer"],
+  .history-table td[data-label="Items"],
+  .history-table td[data-label="Source"] {
+    grid-column: 1 / -1;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  /* Clears the absolutely positioned thumbnail. */
+  .orders-table td.td-order,
+  .orders-table td[data-label="Order"],
+  .history-table td.td-order,
+  .history-table td[data-label="Order"] { padding-left: 3rem; min-height: 2.6rem; }
+
+  .orders-table td.td-customer,
+  .orders-table td[data-label="Customer"],
+  .history-table td.td-customer,
+  .history-table td[data-label="Customer"] { font-weight: 600; }
+
+  .orders-table td.td-items,
+  .orders-table td[data-label="Items"],
+  .history-table td.td-items,
+  .history-table td[data-label="Items"] {
+    max-width: none;
+    padding-bottom: 0.5rem;
+    margin-bottom: 0.2rem;
+    border-bottom: 1px solid var(--hairline);
+  }
+
+  /* Un-truncates cells whose title= tooltip is unreachable on touch. */
+  .orders-table td .cell-truncate,
+  .orders-table td .items-cell,
+  .orders-table td .items-cell div,
+  .history-table td .cell-truncate,
+  .history-table td .items-cell,
+  .history-table td .items-cell div {
+    display: block;
+    max-width: none;
+    overflow: visible;
+    white-space: normal;
+    text-overflow: clip;
+    overflow-wrap: anywhere;
+  }
+
+  /* Money tints become chips instead of full-column bands. */
+  .orders-table td.col-total,
+  .orders-table td.col-cost,
+  .orders-table td.col-margin,
+  .history-table td.col-total,
+  .history-table td.col-cost,
+  .history-table td.col-margin {
+    padding: 0.2rem 0.45rem;
+    margin: -0.1rem -0.15rem;
+    border-radius: 8px;
+  }
+
+  /* Repeats lines 326 and 352-358 so source order wins the tie. */
+  .table-cosmic tbody tr:hover { background: transparent; }
+  .table-cosmic tbody tr.urgency-overdue:hover { background: linear-gradient(90deg, rgba(248, 113, 113, 0.10), transparent 42%); }
+  .table-cosmic tbody tr.urgency-critical:hover { background: linear-gradient(90deg, rgba(251, 146, 60, 0.09), transparent 42%); }
+  .table-cosmic tbody tr.urgency-warning:hover { background: linear-gradient(90deg, rgba(245, 196, 81, 0.07), transparent 42%); }
+  .table-cosmic tbody tr.urgency-ok:hover { background: transparent; box-shadow: inset 3px 0 0 rgba(139, 92, 246, 0.25); }
+
+  .table-footnote { flex-direction: column; align-items: flex-start; gap: 0.4rem; padding: 0.7rem 0.85rem; }
+
+  /* ── Hand-rolled modals become bottom sheets ──────────────────── */
+  /* .modal-card must follow .p-6 / .max-w-lg / .mx-4 / .max-h-[90vh]. */
+
+  .modal-overlay { align-items: flex-end; padding: 0; }
+  .modal-card {
+    width: 100%;
+    max-width: 100%;
+    margin: 0;
+    padding: 1rem;
+    padding-bottom: calc(1rem + env(safe-area-inset-bottom));
+    border-radius: 18px 18px 0 0;
+    max-height: 92vh;
+    max-height: 92dvh;              /* dvh where supported; vh is the fallback */
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  /* ── dioxus-primitives dialogs (logs, order detail) ───────────── */
+  /* Doubled class beats .dialog in both dialog.css and the runtime-injected copy. */
+
+  .dialog.dialog {
+    top: auto;
+    right: auto;
+    bottom: 0;
+    left: 0;
+    transform: none;
+    width: 100%;
+    max-width: 100%;
+    padding: 1rem;
+    padding-bottom: calc(1rem + env(safe-area-inset-bottom));
+    border-radius: 18px 18px 0 0;
+    gap: 0.75rem;
+    max-height: 92vh;
+    max-height: 92dvh;
+  }
+  .dialog.dialog .od-body { overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
+  .dialog-close { top: 0.6rem; right: 0.6rem; min-width: 44px; min-height: 44px; }
+
+  .detail-grid { grid-template-columns: minmax(0, 1fr); gap: 0.1rem; }
+  .detail-grid dt {
+    margin-top: 0.55rem;
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 0.6rem;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--text-faint);
+  }
+  .detail-grid dt:first-child { margin-top: 0; }
+  .detail-grid dd { overflow-wrap: anywhere; }
+
+  .charge-edit { gap: 0.4rem; }
+  .charge-edit > * { min-width: 0; }
+  .charge-edit input[type="number"] { width: 100%; flex: 1 1 6rem; min-width: 0; }
+
+  .link-row { gap: 0.4rem; }
+  .link-row .link-select { flex: 1 1 100%; width: 100%; min-width: 0; }
+
+  /* ── New-order builder ────────────────────────────────────────── */
+
+  .product-picker {
+    max-height: 13rem;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+  .product-option {
+    align-items: flex-start;
+    gap: 0.5rem;
+    min-height: 48px;
+    padding: 0.6rem 0.7rem;
+    font-size: 0.9rem;
+  }
+  .product-option .order-thumb { flex: 0 0 auto; }
+  .product-option .po-name { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+  .product-option .po-meta { flex: 0 0 auto; }
+
+  .draft-line { grid-template-columns: minmax(0, 1fr) 44px; gap: 0.5rem; padding: 0.7rem; }
+  .draft-line-name { flex-wrap: wrap; }
+  .draft-line-name input.dl-name { flex: 1 1 100%; width: 100%; min-width: 0; }
+  .draft-line-fields {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.5rem;
+  }
+  .draft-line-fields select,
+  .draft-line-fields input { width: 100%; min-width: 0; }
+  .draft-line .dl-size,
+  .draft-line .dl-qty,
+  .draft-line .dl-price { width: 100%; }
+  .draft-line-remove { width: 44px; height: 44px; align-self: start; font-size: 1.4rem; }
+}

@@ -1,7 +1,7 @@
 //! Shopify API client: fetch orders and map to shared [crate::model] types.
 
 use crate::log;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::Deserialize;
 
 use crate::model::{MetalType, Order, OrderItem, OrderSource};
@@ -12,6 +12,22 @@ fn shopify_url() -> String {
 fn shopify_access_token() -> String {
     std::env::var("SHOPIFY_ACCESS_TOKEN").unwrap_or_default()
 }
+
+/// Rolling window for a routine refresh; open orders are pulled regardless of age.
+pub fn lookback_days() -> i64 {
+    std::env::var("ORDER_LOOKBACK_DAYS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .filter(|d| *d > 0)
+        .unwrap_or(90)
+}
+
+/// Page cap for one orders.json sweep (250 orders/page).
+const MAX_ORDER_PAGES: usize = 200;
+/// Consecutive 429 retries tolerated per sweep before giving up.
+const MAX_RATE_LIMIT_RETRIES: u32 = 8;
+/// Cap on per-product image lookups in one fetch.
+const MAX_IMAGE_LOOKUPS: usize = 400;
 
 // ---------------------------------------------------------------------------
 // Shopify API response types
@@ -33,6 +49,10 @@ struct ShopifyOrder {
     currency: String,
     fulfillment_status: Option<String>,
     shipping_address: Option<ShopifyAddress>,
+    #[serde(default)]
+    cancelled_at: Option<String>,
+    #[serde(default)]
+    closed_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -144,14 +164,51 @@ async fn fetch_product_image_urls(
     ids: &[i64],
 ) -> std::collections::HashMap<i64, String> {
     let mut out = std::collections::HashMap::new();
-    for &id in ids {
+    if ids.len() > MAX_IMAGE_LOOKUPS {
+        log::app_log(
+            "ERROR",
+            format!(
+                "Shopify: {} products need images but only the first {} are looked up; \
+                 the rest have no thumbnail.",
+                ids.len(),
+                MAX_IMAGE_LOOKUPS
+            ),
+        );
+    }
+    for &id in ids.iter().take(MAX_IMAGE_LOOKUPS) {
         let url = format!("{}/products/{}.json?fields=id,image", base_url, id);
-        let resp = client
-            .get(&url)
-            .header("X-Shopify-Access-Token", token)
-            .send()
-            .await;
-        if let Ok(r) = resp {
+        let mut retries = 0u32;
+        loop {
+            let resp = client
+                .get(&url)
+                .header("X-Shopify-Access-Token", token)
+                .send()
+                .await;
+            let r = match resp {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+            if r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                if retries >= MAX_RATE_LIMIT_RETRIES {
+                    log::app_log(
+                        "ERROR",
+                        format!(
+                            "Shopify: rate limited on the image for product {} after {} retries; skipped.",
+                            id, MAX_RATE_LIMIT_RETRIES
+                        ),
+                    );
+                    break;
+                }
+                retries += 1;
+                let wait = r
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .unwrap_or(2.0);
+                tokio::time::sleep(std::time::Duration::from_secs_f32(wait)).await;
+                continue;
+            }
             if r.status().is_success() {
                 if let Ok(p) = r.json::<ShopifyProductResponse>().await {
                     let src = p.product.image.and_then(|i| i.src).filter(|s| !s.is_empty());
@@ -160,45 +217,186 @@ async fn fetch_product_image_urls(
                     }
                 }
             }
+            break;
         }
     }
     out
+}
+
+/// Paginate orders.json for one status filter, following the Link header cursor.
+/// `created_at_min` applies to the first request only — Shopify forbids any
+/// parameter other than `limit` and `fields` alongside `page_info`.
+async fn sweep_orders(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    order_status: &str,
+    created_at_min: Option<DateTime<Utc>>,
+) -> Result<Vec<ShopifyOrder>, String> {
+    let mut url = match created_at_min {
+        Some(t) => format!(
+            "{}/orders.json?status={}&limit=250&created_at_min={}",
+            base,
+            order_status,
+            t.to_rfc3339_opts(SecondsFormat::Secs, true)
+        ),
+        None => format!("{}/orders.json?status={}&limit=250", base, order_status),
+    };
+    let mut out: Vec<ShopifyOrder> = Vec::new();
+    let mut page = 0usize;
+    let mut retries = 0u32;
+    loop {
+        let resp = client
+            .get(&url)
+            .header("X-Shopify-Access-Token", token)
+            .header("Content-Type", "application/json")
+            .send()
+            .await
+            .map_err(|e| format!("Shopify request failed: {}", e))?;
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            if retries >= MAX_RATE_LIMIT_RETRIES {
+                return Err(format!(
+                    "Shopify rate limited on status={} after {} retries ({} orders collected)",
+                    order_status,
+                    MAX_RATE_LIMIT_RETRIES,
+                    out.len()
+                ));
+            }
+            retries += 1;
+            let wait = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(2.0);
+            tokio::time::sleep(std::time::Duration::from_secs_f32(wait)).await;
+            continue;
+        }
+        if !resp.status().is_success() {
+            return Err(format!("Shopify API error: {}", resp.status()));
+        }
+        retries = 0;
+        let link = resp
+            .headers()
+            .get(reqwest::header::LINK)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let body: ShopifyOrdersResponse = resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse Shopify response: {}", e))?;
+        page += 1;
+        let n = body.orders.len();
+        out.extend(body.orders);
+        log::app_log(
+            "INFO",
+            format!(
+                "Shopify: status={} page {} got {} orders (total {})",
+                order_status,
+                page,
+                n,
+                out.len()
+            ),
+        );
+        match link.as_deref().and_then(next_page_info) {
+            Some(pi) => {
+                if page >= MAX_ORDER_PAGES {
+                    log::app_log(
+                        "ERROR",
+                        format!(
+                            "Shopify: stopped at the {}-page cap for status={} with {} orders; \
+                             more pages remain and were NOT fetched.",
+                            MAX_ORDER_PAGES,
+                            order_status,
+                            out.len()
+                        ),
+                    );
+                    break;
+                }
+                // page_info requests may carry only limit and fields.
+                url = format!("{}/orders.json?limit=250&page_info={}", base, pi);
+            }
+            None => break,
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Fetch orders from Shopify (last 60 days, any status).
-pub async fn fetch_shopify_orders() -> Result<Vec<Order>, String> {
-    log::app_log("INFO", "Shopify: requesting orders (last 60 days)...");
+/// Fetch orders from Shopify, paginating every page via the Link header.
+/// `Some(t)` is the routine refresh: every OPEN order regardless of age, plus all
+/// orders created since `t`. `None` is a full history backfill.
+pub async fn fetch_shopify_orders(
+    created_at_min: Option<DateTime<Utc>>,
+) -> Result<Vec<Order>, String> {
+    let base = shopify_url();
+    let token = shopify_access_token();
+    if base.is_empty() || token.is_empty() {
+        return Err("Shopify not configured".to_string());
+    }
     let client = reqwest::Client::new();
-    let two_months_ago = Utc::now() - Duration::days(60);
-    let created_at_min = two_months_ago.format("%Y-%m-%dT%H:%M:%S%:z").to_string();
-    let url = format!(
-        "{}/orders.json?status=any&limit=250&created_at_min={}",
-        shopify_url(),
-        created_at_min
-    );
 
-    let response = client
-        .get(&url)
-        .header("X-Shopify-Access-Token", shopify_access_token())
-        .header("Content-Type", "application/json")
-        .send()
-        .await
-        .map_err(|e| format!("Shopify request failed: {}", e))?;
-
-    if !response.status().is_success() {
-        return Err(format!("Shopify API error: {}", response.status()));
+    let mut raw: Vec<ShopifyOrder> = Vec::new();
+    match created_at_min {
+        Some(t) => {
+            log::app_log(
+                "INFO",
+                format!(
+                    "Shopify: open orders (all ages) + everything since {}...",
+                    t.format("%Y-%m-%d")
+                ),
+            );
+            // No date bound on open orders so an old unfulfilled order is never missed.
+            raw.extend(sweep_orders(&client, &base, &token, "open", None).await?);
+            raw.extend(sweep_orders(&client, &base, &token, "any", Some(t)).await?);
+        }
+        None => {
+            log::app_log("INFO", "Shopify: full history backfill (all orders, all time)...");
+            raw.extend(sweep_orders(&client, &base, &token, "any", None).await?);
+        }
     }
 
-    let shopify_response: ShopifyOrdersResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse Shopify response: {}", e))?;
+    let before = raw.len();
+    let mut seen = std::collections::HashSet::new();
+    raw.retain(|o| seen.insert(o.id));
+    log::app_log(
+        "INFO",
+        format!(
+            "Shopify: {} orders after dedupe ({} raw), mapping...",
+            raw.len(),
+            before
+        ),
+    );
 
-    log::app_log("INFO", format!("Shopify: got {} orders, mapping...", shopify_response.orders.len()));
+    if created_at_min.is_none() {
+        if let Some(oldest) = raw
+            .iter()
+            .filter_map(|o| DateTime::parse_from_rfc3339(&o.created_at).ok())
+            .min()
+        {
+            let age = (Utc::now() - oldest.with_timezone(&Utc)).num_days();
+            log::app_log(
+                "INFO",
+                format!(
+                    "Shopify: oldest order returned is {} days old ({}).",
+                    age,
+                    oldest.format("%Y-%m-%d")
+                ),
+            );
+            if age < 70 {
+                log::app_log(
+                    "ERROR",
+                    "Shopify: backfill reached only ~60 days. The Order resource is capped at \
+                     60 days without the read_all_orders scope, so older orders were not returned.",
+                );
+            }
+        }
+    }
+
+    let shopify_response = ShopifyOrdersResponse { orders: raw };
 
     let mut product_ids: Vec<i64> = shopify_response
         .orders
@@ -285,6 +483,11 @@ pub async fn fetch_shopify_orders() -> Result<Vec<Order>, String> {
                 )
             });
 
+            // Seed only; the DB overlay replaces it downstream.
+            let completed = so.cancelled_at.is_some()
+                || so.closed_at.is_some()
+                || so.fulfillment_status.as_deref() == Some("fulfilled");
+
             Order {
                 id: so.id.to_string(),
                 source: OrderSource::Shopify,
@@ -295,10 +498,16 @@ pub async fn fetch_shopify_orders() -> Result<Vec<Order>, String> {
                 due_date,
                 total_price: so.total_price.parse().unwrap_or(0.0),
                 currency: so.currency,
-                status: so.fulfillment_status.unwrap_or_else(|| "unfulfilled".to_string()),
+                status: if so.cancelled_at.is_some() {
+                    "cancelled".to_string()
+                } else if so.closed_at.is_some() {
+                    so.fulfillment_status.unwrap_or_else(|| "closed".to_string())
+                } else {
+                    so.fulfillment_status.unwrap_or_else(|| "unfulfilled".to_string())
+                },
                 shipping_address,
                 archived: false,
-                completed: false,
+                completed,
                 notes: None,
                 stage: None,
             }

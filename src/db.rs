@@ -48,6 +48,9 @@ pub async fn ensure_db_init() -> Result<(), String> {
             }
             DB.use_ns(NS).use_db(DB_NAME).await.map_err(|e| e.to_string())?;
             eprintln!("Using NS: {}, DB: {}", NS, DB_NAME);
+            if let Err(e) = migrate_orders().await {
+                crate::log::app_log("ERROR", format!("Order archive migration failed: {}", e));
+            }
             Ok(())
         })
         .await
@@ -77,7 +80,7 @@ fn source_tag(s: &OrderSource) -> &'static str {
 
 /// An order item as stored in SurrealDB: image is a native `record<file>`
 /// pointer into the thumbnails bucket, not a string.
-#[derive(SurrealValue)]
+#[derive(SurrealValue, Clone)]
 struct CachedItem {
     name: String,
     quantity: i64,
@@ -124,7 +127,7 @@ impl CachedItem {
 }
 
 /// An order stored as a real SurrealDB object (the `payload`).
-#[derive(SurrealValue)]
+#[derive(SurrealValue, Clone)]
 struct CachedOrder {
     order_id: String,
     source: String,
@@ -137,6 +140,9 @@ struct CachedOrder {
     currency: String,
     status: String,
     shipping_address: Option<String>,
+    /// Fulfilled/shipped/cancelled at the source. Option tolerates rows written
+    /// before this field existed. The order_state overlay still outranks it.
+    completed: Option<bool>,
 }
 
 impl CachedOrder {
@@ -153,6 +159,7 @@ impl CachedOrder {
             currency: o.currency.clone(),
             status: o.status.clone(),
             shipping_address: o.shipping_address.clone(),
+            completed: Some(o.completed),
         }
     }
 
@@ -174,46 +181,277 @@ impl CachedOrder {
             status: self.status,
             shipping_address: self.shipping_address,
             archived: false,
-            completed: false,
+            completed: self.completed.unwrap_or(false),
             notes: None,
             stage: None,
         }
     }
 }
 
-#[derive(SurrealValue)]
+/// One row of the persistent order archive. `key` is bound as the record id, not
+/// written as a column: the `orders` table is SCHEMAFULL and declares only
+/// source, order_number, payload and fetched_at.
+#[derive(SurrealValue, Clone)]
 struct OrderCacheRow {
+    key: String,
     source: String,
     order_number: String,
     payload: CachedOrder,
 }
 
-/// Orders cached within the last day (empty = stale/miss).
-pub async fn load_cached_orders() -> Result<Vec<Order>, String> {
+#[derive(SurrealValue)]
+struct CountRow {
+    n: i64,
+}
+
+/// Record-id keys must be non-empty and free of control characters.
+fn valid_record_key(key: &str) -> bool {
+    !key.is_empty() && !key.chars().any(char::is_control)
+}
+
+/// Rows per statement; surrealkv takes one writer, so keep each batch bounded.
+const ORDER_CHUNK: usize = 250;
+
+/// Add or update orders keyed by Order::state_key. Never deletes: the archive is
+/// the source of truth for the order set, the APIs only supply updates.
+pub async fn upsert_orders(orders: &[Order]) -> Result<(), String> {
+    let rows: Vec<OrderCacheRow> = orders
+        .iter()
+        .filter(|o| valid_record_key(&o.state_key()))
+        .map(|o| OrderCacheRow {
+            key: o.state_key(),
+            source: source_tag(&o.source).to_string(),
+            order_number: o.order_number.clone(),
+            payload: CachedOrder::from_order(o),
+        })
+        .collect();
+    let skipped = orders.len() - rows.len();
+    if skipped > 0 {
+        crate::log::app_log(
+            "ERROR",
+            format!("Order archive: skipped {} order(s) with an unusable record key.", skipped),
+        );
+    }
+    for chunk in rows.chunks(ORDER_CHUNK) {
+        DB.query(
+            "FOR $r IN $rows { \
+                 UPSERT type::record('orders', $r.key) SET \
+                     source = $r.source, \
+                     order_number = $r.order_number, \
+                     payload = $r.payload; \
+             };",
+        )
+        .bind(("rows", chunk.to_vec()))
+        .await
+        .map_err(|e| e.to_string())?
+        .check()
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// The order_state rows that decide open vs past, split by what they decide.
+struct StateSplit {
+    /// Explicitly archived or completed by the user.
+    closed: Vec<String>,
+    /// Explicitly re-opened, which outranks a source-completed payload.
+    reopened: Vec<String>,
+    /// Explicitly archived.
+    archived: Vec<String>,
+}
+
+async fn state_split() -> Result<StateSplit, String> {
     let mut res = DB
-        .query("SELECT VALUE payload FROM orders WHERE fetched_at > time::now() - 1d")
+        .query(
+            "SELECT VALUE record::id(id) FROM order_state WHERE archived = true OR completed = true; \
+             SELECT VALUE record::id(id) FROM order_state WHERE completed = false AND archived != true; \
+             SELECT VALUE record::id(id) FROM order_state WHERE archived = true;",
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let closed: Vec<String> = res.take(0).map_err(|e| e.to_string())?;
+    let reopened: Vec<String> = res.take(1).map_err(|e| e.to_string())?;
+    let archived: Vec<String> = res.take(2).map_err(|e| e.to_string())?;
+    Ok(StateSplit { closed, reopened, archived })
+}
+
+/// An order is past when the user closed it, or the source reports it
+/// fulfilled/shipped/cancelled and the user has not explicitly re-opened it.
+const PAST_PRED: &str = "(record::id(id) IN $closed \
+    OR (payload.completed = true AND record::id(id) NOT IN $reopened))";
+
+/// Open work only. Past orders are dropped at the DB level so the board stays
+/// bounded as the archive grows. Never capped.
+pub async fn load_open_orders() -> Result<Vec<Order>, String> {
+    let s = state_split().await?;
+    let mut res = DB
+        .query(format!(
+            "SELECT VALUE payload FROM orders WHERE !{PAST_PRED} \
+             ORDER BY payload.order_date DESC"
+        ))
+        .bind(("closed", s.closed))
+        .bind(("reopened", s.reopened))
         .await
         .map_err(|e| e.to_string())?;
     let cached: Vec<CachedOrder> = res.take(0).map_err(|e| e.to_string())?;
     Ok(cached.into_iter().map(CachedOrder::into_order).collect())
 }
 
-/// Replace the order cache with the given set (fetched_at set to now).
-pub async fn save_orders(orders: &[Order]) -> Result<(), String> {
-    let rows: Vec<OrderCacheRow> = orders
-        .iter()
-        .map(|o| OrderCacheRow {
-            source: source_tag(&o.source).to_string(),
-            order_number: o.order_number.clone(),
-            payload: CachedOrder::from_order(o),
-        })
-        .collect();
-    DB.query("DELETE orders; INSERT INTO orders $rows")
-        .bind(("rows", rows))
+/// Newest fetched_at in the archive; None when empty. Freshness only decides
+/// whether to ALSO refresh — never whether to return rows.
+pub async fn cache_age() -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+    let mut res = DB
+        .query("SELECT VALUE fetched_at FROM orders ORDER BY fetched_at DESC LIMIT 1")
+        .await
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<chrono::DateTime<chrono::Utc>> = res.take(0).map_err(|e| e.to_string())?;
+    Ok(rows.into_iter().next())
+}
+
+/// Matches an already-lowercased $q against order number, customer and item names.
+const HISTORY_SEARCH: &str = "string::contains(string::lowercase(string::concat(\
+    order_number, ' ', (payload.customer_name ?? ''), ' ', \
+    array::join((payload.items.name ?? []), ' '))), $q)";
+
+/// The Rust twin of [HISTORY_SEARCH], for orders not stored in the archive.
+fn order_text_matches(o: &Order, q: &str) -> bool {
+    if q.is_empty() {
+        return true;
+    }
+    let mut hay = format!("{} {}", o.order_number, o.customer_name);
+    for it in &o.items {
+        hay.push(' ');
+        hay.push_str(&it.name);
+    }
+    hay.to_lowercase().contains(q)
+}
+
+/// Past custom orders matching the same filters as the archive query. They live
+/// in custom_orders, not orders, so History must fold them in explicitly.
+async fn past_custom_orders(
+    since: Option<chrono::DateTime<chrono::Utc>>,
+    q: &str,
+    src: &str,
+    state: &str,
+) -> Vec<Order> {
+    if !src.is_empty() && src != "custom" {
+        return Vec::new();
+    }
+    let mut custom = match load_custom_orders().await {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log::app_log("ERROR", format!("History: custom orders unavailable: {}", e));
+            return Vec::new();
+        }
+    };
+    apply_order_state(&mut custom).await;
+    custom.retain(|o| {
+        (o.archived || o.completed)
+            && since.map_or(true, |s| o.order_date > s)
+            && match state {
+                "archived" => o.archived,
+                "completed" => !o.archived,
+                _ => true,
+            }
+            && order_text_matches(o, q)
+    });
+    custom
+}
+
+/// One page of past orders (newest first) plus the total matching count.
+/// `days` = 0 means all time; `source` is "shopify" | "etsy" | "custom", None =
+/// all; `state` is "archived" | "completed", empty = every past order.
+pub async fn load_order_history(
+    days: i64,
+    query: &str,
+    source: Option<&str>,
+    state: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<(Vec<Order>, usize), String> {
+    let since: Option<chrono::DateTime<chrono::Utc>> = if days > 0 {
+        Some(chrono::Utc::now() - chrono::Duration::days(days))
+    } else {
+        None
+    };
+    let q = query.trim().to_lowercase();
+    let src = source.unwrap_or("").trim().to_string();
+    let s = state_split().await?;
+    // Past-only, so an open order can never be reachable from History alone.
+    let mut preds: Vec<&str> = vec![PAST_PRED];
+    match state {
+        "archived" => preds.push("record::id(id) IN $archived"),
+        "completed" => preds.push("record::id(id) NOT IN $archived"),
+        _ => {}
+    }
+    if since.is_some() {
+        preds.push("payload.order_date > $since");
+    }
+    if !src.is_empty() {
+        preds.push("source = $src");
+    }
+    if !q.is_empty() {
+        preds.push(HISTORY_SEARCH);
+    }
+    let filter = format!("WHERE {}", preds.join(" AND "));
+    // Take the first offset+limit archive rows rather than the exact page: custom
+    // orders are merged in below, and no row past that index can surface inside it.
+    let take = offset.saturating_add(limit) as i64;
+    let sql = format!(
+        "SELECT VALUE payload FROM orders {filter} \
+         ORDER BY payload.order_date DESC LIMIT $take; \
+         SELECT count() AS n FROM orders {filter} GROUP ALL;"
+    );
+    let mut res = DB
+        .query(sql)
+        .bind(("since", since))
+        .bind(("src", src.clone()))
+        .bind(("q", q.clone()))
+        .bind(("closed", s.closed))
+        .bind(("reopened", s.reopened))
+        .bind(("archived", s.archived))
+        .bind(("take", take))
+        .await
+        .map_err(|e| e.to_string())?;
+    let cached: Vec<CachedOrder> = res.take(0).map_err(|e| e.to_string())?;
+    let counts: Vec<CountRow> = res.take(1).map_err(|e| e.to_string())?;
+    let total = counts.first().map(|c| c.n.max(0) as usize).unwrap_or(0);
+
+    let custom = past_custom_orders(since, &q, &src, state).await;
+    let mut rows: Vec<Order> = cached.into_iter().map(CachedOrder::into_order).collect();
+    let total = total + custom.len();
+    rows.extend(custom);
+    rows.sort_by(|a, b| b.order_date.cmp(&a.order_date));
+    let page = rows.into_iter().skip(offset).take(limit).collect();
+    Ok((page, total))
+}
+
+/// Archive rows written before the record id became Order::state_key.
+const UNKEYED_ROWS: &str = "WHERE !string::starts_with(<string>record::id(id), 'shopify_') \
+    AND !string::starts_with(<string>record::id(id), 'etsy_') \
+    AND !string::starts_with(<string>record::id(id), 'custom_')";
+
+/// Drop archive rows with a random record id, which would otherwise shadow the
+/// keyed rows forever. Idempotent: after the first run the DELETE matches nothing.
+async fn migrate_orders() -> Result<(), String> {
+    let mut res = DB
+        .query(format!("SELECT count() AS n FROM orders {UNKEYED_ROWS} GROUP ALL"))
+        .await
+        .map_err(|e| e.to_string())?;
+    let counts: Vec<CountRow> = res.take(0).map_err(|e| e.to_string())?;
+    let n = counts.first().map(|c| c.n.max(0)).unwrap_or(0);
+    if n == 0 {
+        return Ok(());
+    }
+    DB.query(format!("DELETE orders {UNKEYED_ROWS}"))
         .await
         .map_err(|e| e.to_string())?
         .check()
         .map_err(|e| e.to_string())?;
+    crate::log::app_log(
+        "ERROR",
+        format!("Order archive migration: deleted {} unkeyed row(s).", n),
+    );
     Ok(())
 }
 
@@ -230,18 +468,20 @@ struct SizeOverride {
 #[derive(SurrealValue)]
 struct OrderStateRow {
     rid: String,
-    archived: bool,
-    completed: bool,
+    archived: Option<bool>,
+    completed: Option<bool>,
     notes: Option<String>,
     stage: Option<String>,
     size_overrides: Option<Vec<SizeOverride>>,
 }
 
 /// Per-order overlay persisted in order_state (keyed by Order::state_key).
+/// `archived` and `completed` stay None on a row that only carries notes, a
+/// stage or size overrides, so those rows never reset the order's flags.
 #[derive(Clone, Default)]
 pub struct OrderStateData {
-    pub archived: bool,
-    pub completed: bool,
+    pub archived: Option<bool>,
+    pub completed: Option<bool>,
     pub notes: Option<String>,
     pub stage: Option<String>,
     /// item index -> overridden ring size.
@@ -251,7 +491,7 @@ pub struct OrderStateData {
 /// Map of state_key -> overlay from the persistent order_state table.
 pub async fn load_order_state() -> Result<std::collections::HashMap<String, OrderStateData>, String> {
     let mut res = DB
-        .query("SELECT <string>id AS rid, archived ?? false AS archived, completed ?? false AS completed, notes, stage, size_overrides FROM order_state")
+        .query("SELECT <string>id AS rid, archived, completed, notes, stage, size_overrides FROM order_state")
         .await
         .map_err(|e| e.to_string())?;
     let rows: Vec<OrderStateRow> = res.take(0).map_err(|e| e.to_string())?;
@@ -423,27 +663,42 @@ pub async fn update_custom_order(order: &Order) -> Result<(), String> {
     Ok(())
 }
 
-/// Merge live/cached Shopify+Etsy orders with custom orders, then apply the
-/// archive/complete overlay from order_state.
-pub async fn merge_orders(mut base: Vec<Order>) -> Vec<Order> {
-    if let Ok(custom) = load_custom_orders().await {
-        base.extend(custom);
-    }
-    if let Ok(state) = load_order_state().await {
-        for o in base.iter_mut() {
-            if let Some(s) = state.get(&o.state_key()) {
-                o.archived = s.archived;
-                o.completed = s.completed;
-                o.notes = s.notes.clone();
-                o.stage = s.stage.clone();
-                for (i, item) in o.items.iter_mut().enumerate() {
-                    if let Some(sz) = s.size_overrides.get(&i) {
-                        item.ring_size = Some(sz.clone());
-                    }
+/// Apply the archive/complete/notes/stage/size overlay from order_state.
+pub async fn apply_order_state(orders: &mut [Order]) {
+    let state = match load_order_state().await {
+        Ok(s) => s,
+        Err(e) => {
+            crate::log::app_log("ERROR", format!("Order state overlay: {}", e));
+            return;
+        }
+    };
+    for o in orders.iter_mut() {
+        if let Some(s) = state.get(&o.state_key()) {
+            if let Some(archived) = s.archived {
+                o.archived = archived;
+            }
+            if let Some(completed) = s.completed {
+                o.completed = completed;
+            }
+            o.notes = s.notes.clone();
+            o.stage = s.stage.clone();
+            for (i, item) in o.items.iter_mut().enumerate() {
+                if let Some(sz) = s.size_overrides.get(&i) {
+                    item.ring_size = Some(sz.clone());
                 }
             }
         }
     }
+}
+
+/// Merge live/cached Shopify+Etsy orders with custom orders, then apply the
+/// archive/complete overlay from order_state.
+pub async fn merge_orders(mut base: Vec<Order>) -> Vec<Order> {
+    match load_custom_orders().await {
+        Ok(custom) => base.extend(custom),
+        Err(e) => crate::log::app_log("ERROR", format!("Custom orders: {}", e)),
+    }
+    apply_order_state(&mut base).await;
     base
 }
 

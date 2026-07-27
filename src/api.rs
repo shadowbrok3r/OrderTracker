@@ -20,34 +20,91 @@ pub struct FetchOrdersResult {
     pub errors: Vec<String>,
 }
 
-/// Fetch live from Shopify + Etsy (errors collected per source) and replace the
-/// SurrealDB order cache.
+/// One page of past orders, newest first.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderHistoryPage {
+    pub orders: Vec<Order>,
+    /// Total rows matching the filter, ignoring limit/offset.
+    pub total: usize,
+    pub errors: Vec<String>,
+}
+
+/// Outcome of a manual all-time backfill.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackfillResult {
+    pub fetched: usize,
+    pub errors: Vec<String>,
+}
+
+/// Serializes marketplace syncs; surrealkv takes a single writer and the 6h
+/// refresh loop can otherwise overlap a manual Refresh.
 #[cfg(feature = "server")]
-pub(crate) async fn live_fetch_and_cache() -> FetchOrdersResult {
-    let mut all_orders = Vec::new();
+static SYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Serve the archive without re-pulling when it was synced within this window.
+#[cfg(feature = "server")]
+const CACHE_TTL_HOURS: i64 = 6;
+
+/// Pull from both marketplaces and upsert into the archive. Returns the orders
+/// that were fetched alongside any errors, so callers can still serve them when
+/// the archive is unreachable.
+#[cfg(feature = "server")]
+async fn sync_sources(
+    shopify_since: Option<chrono::DateTime<chrono::Utc>>,
+    etsy_since: Option<chrono::DateTime<chrono::Utc>>,
+    include_shipped: bool,
+) -> (Vec<String>, Vec<Order>) {
+    // try_lock, never lock: a page load must degrade to slightly-stale archive
+    // data rather than block behind a multi-minute backfill.
+    let Ok(_guard) = SYNC_LOCK.try_lock() else {
+        return (
+            vec!["A sync is already running; showing the stored orders.".to_string()],
+            Vec::new(),
+        );
+    };
+    let mut fresh = Vec::new();
     let mut errors = Vec::new();
 
-    match crate::shopify::fetch_shopify_orders().await {
-        Ok(shopify_orders) => all_orders.extend(shopify_orders),
+    match crate::shopify::fetch_shopify_orders(shopify_since).await {
+        Ok(v) => fresh.extend(v),
         Err(e) => errors.push(format!("Shopify: {}", e)),
     }
-    match crate::etsy::fetch_etsy_orders().await {
-        Ok(etsy_orders) => all_orders.extend(etsy_orders),
+    match crate::etsy::fetch_etsy_orders(etsy_since, include_shipped).await {
+        Ok(v) => fresh.extend(v),
         Err(e) => errors.push(format!("Etsy: {}", e)),
     }
-    all_orders.sort_by(|a, b| a.due_date.cmp(&b.due_date));
 
-    let mut orders = if crate::db::ensure_db_init().await.is_ok() {
-        if !all_orders.is_empty() {
-            cache_thumbnails(&mut all_orders).await;
-            if let Err(e) = crate::db::save_orders(&all_orders).await {
-                crate::log::app_log("INFO", format!("Order cache write failed: {}", e));
-            }
+    if crate::db::ensure_db_init().await.is_err() {
+        errors.push("SurrealDB unavailable; orders not archived.".to_string());
+        return (errors, fresh);
+    }
+    if !fresh.is_empty() {
+        cache_thumbnails(&mut fresh).await;
+        if let Err(e) = crate::db::upsert_orders(&fresh).await {
+            errors.push(format!("Order cache write failed: {}", e));
         }
-        crate::db::merge_orders(all_orders).await
-    } else {
-        all_orders
+    }
+    (errors, fresh)
+}
+
+/// Routine refresh: pull updates from Shopify + Etsy into the archive, then serve
+/// the archive. A live fetch only ever adds or updates, never removes.
+#[cfg(feature = "server")]
+pub(crate) async fn live_fetch_and_cache() -> FetchOrdersResult {
+    let since = chrono::Utc::now() - chrono::Duration::days(crate::shopify::lookback_days());
+    let (mut errors, fresh) = sync_sources(Some(since), Some(since), false).await;
+
+    // The archive is an optimization over the live pull, never the only source a
+    // response can come from: if it is unreachable, serve what was just fetched
+    // rather than blanking the board.
+    let base = match crate::db::load_open_orders().await {
+        Ok(v) => v,
+        Err(e) => {
+            errors.push(format!("Order cache read failed; showing the live pull: {}", e));
+            fresh.into_iter().filter(|o| !o.completed).collect()
+        }
     };
+    let mut orders = crate::db::merge_orders(base).await;
     orders.sort_by(|a, b| a.due_date.cmp(&b.due_date));
     FetchOrdersResult { orders, errors }
 }
@@ -57,30 +114,42 @@ pub(crate) async fn live_fetch_and_cache() -> FetchOrdersResult {
 #[cfg(feature = "server")]
 async fn cache_thumbnails(orders: &mut [Order]) {
     let client = reqwest::Client::new();
+    let mut resolved: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for order in orders.iter_mut() {
         for item in order.items.iter_mut() {
-            if let Some(url) = item.image_url.clone() {
-                if url.starts_with("http") {
-                    if let Some(cached) = crate::db::cache_thumbnail(&client, &url).await {
-                        item.image_url = Some(cached);
-                    }
-                }
+            let Some(url) = item.image_url.clone() else { continue };
+            if url.starts_with("thumb/") {
+                continue;
+            }
+            if !url.starts_with("http") {
+                continue;
+            }
+            if let Some(hit) = resolved.get(&url) {
+                item.image_url = Some(hit.clone());
+                continue;
+            }
+            if let Some(cached) = crate::db::cache_thumbnail(&client, &url).await {
+                resolved.insert(url, cached.clone());
+                item.image_url = Some(cached);
             }
         }
     }
 }
 
-/// Return cached orders if fresh (< 1 day), otherwise fetch live and cache.
-/// Cache-aware order fetch (no HA push) shared by the server fn and the
-/// background HA-refresh loop.
+/// Serve the archive when it was synced recently, otherwise pull live first.
+/// Staleness means "refresh as well", never "return nothing".
 #[cfg(feature = "server")]
 async fn fetch_orders_internal() -> FetchOrdersResult {
     if crate::db::ensure_db_init().await.is_ok() {
-        if let Ok(base) = crate::db::load_cached_orders().await {
-            if !base.is_empty() {
+        let fresh = matches!(
+            crate::db::cache_age().await,
+            Ok(Some(t)) if chrono::Utc::now() - t < chrono::Duration::hours(CACHE_TTL_HOURS)
+        );
+        if fresh {
+            if let Ok(base) = crate::db::load_open_orders().await {
                 let mut orders = crate::db::merge_orders(base).await;
                 orders.sort_by(|a, b| a.due_date.cmp(&b.due_date));
-                crate::log::app_log("INFO", format!("Served {} orders from cache.", orders.len()));
+                crate::log::app_log("INFO", format!("Served {} open orders from cache.", orders.len()));
                 return FetchOrdersResult { orders, errors: Vec::new() };
             }
         }
@@ -101,6 +170,41 @@ pub async fn refresh_orders() -> Result<FetchOrdersResult, ServerFnError> {
     let result = live_fetch_and_cache().await;
     crate::ha::push_orders(&result.orders).await;
     Ok(result)
+}
+
+/// One page of past orders (archived or completed) plus the total match count.
+#[server]
+pub async fn fetch_order_history(
+    days: i64,
+    query: String,
+    source: String,
+    state: String,
+    limit: u32,
+    offset: u32,
+) -> Result<OrderHistoryPage, ServerFnError> {
+    crate::db::ensure_db_init().await.map_err(|e| ServerFnError::new(e))?;
+    let src = if source.is_empty() { None } else { Some(source.as_str()) };
+    let (mut orders, total) = crate::db::load_order_history(
+        days,
+        &query,
+        src,
+        &state,
+        limit.clamp(1, 500) as usize,
+        offset as usize,
+    )
+    .await
+    .map_err(|e| ServerFnError::new(e))?;
+    crate::db::apply_order_state(&mut orders).await;
+    Ok(OrderHistoryPage { orders, total, errors: Vec::new() })
+}
+
+/// Manual all-time backfill (shipped + unshipped, no date bound). Never runs on
+/// the page-load or timer path, and deliberately does not push to Home Assistant.
+#[server]
+pub async fn backfill_order_history() -> Result<BackfillResult, ServerFnError> {
+    crate::db::ensure_db_init().await.map_err(|e| ServerFnError::new(e))?;
+    let (errors, fresh) = sync_sources(None, None, true).await;
+    Ok(BackfillResult { fetched: fresh.len(), errors })
 }
 
 /// Load the jewelry catalog (pieces + linked sizes) from SurrealDB.

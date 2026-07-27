@@ -1,7 +1,7 @@
 //! Etsy API v3 client: OAuth token handling and shop receipts (orders).
 
 use crate::log;
-use chrono::{Duration, TimeZone, Utc};
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -122,6 +122,45 @@ pub fn save_etsy_refresh_token(refresh_token: String) -> Result<(), String> {
     save_etsy_config(&cfg)
 }
 
+/// Etsy caps getShopReceipts `limit` at 100.
+const RECEIPTS_LIMIT: i32 = 100;
+/// Pagination bound: 100 pages x 100 receipts.
+const MAX_RECEIPT_PAGES: u32 = 100;
+/// Per-run bound on individual listing-image lookups.
+const MAX_IMAGE_LOOKUPS: usize = 400;
+/// Etsy rejects min_created earlier than 2000-01-01.
+const ETSY_MIN_TIMESTAMP: i64 = 946_684_800;
+
+/// GET an Etsy endpoint with the shared auth headers, retrying on 429.
+async fn etsy_get(
+    client: &reqwest::Client,
+    url: &str,
+    access_token: &str,
+    x_api_key: &str,
+) -> Result<reqwest::Response, String> {
+    for attempt in 1..=4u32 {
+        let resp = client
+            .get(url)
+            .header("x-api-key", x_api_key)
+            .header("Authorization", format!("Bearer {}", access_token))
+            .send()
+            .await
+            .map_err(|e| format!("Etsy request failed: {}", e))?;
+        if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Ok(resp);
+        }
+        let wait = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(2.0);
+        log::app_log("INFO", format!("Etsy: 429, waiting {:.1}s (attempt {}/4)", wait, attempt));
+        tokio::time::sleep(std::time::Duration::from_secs_f32(wait)).await;
+    }
+    Err("Etsy rate limit: gave up after 4 attempts".to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Etsy API response types (v3 shop receipts)
 // ---------------------------------------------------------------------------
@@ -146,6 +185,8 @@ struct EtsyReceipt {
     first_line: Option<String>,
     formatted_address: Option<String>,
     status: Option<String>,
+    #[serde(default)]
+    is_shipped: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -182,6 +223,7 @@ struct EtsyListingImage {
     #[serde(rename = "url_570xN")]
     url_570xn: Option<String>,
     url_640x640: Option<String>,
+    url_fullxfull: Option<String>,
 }
 
 async fn fetch_listing_image_urls(
@@ -191,30 +233,47 @@ async fn fetch_listing_image_urls(
     keys: &[(i64, i64)],
 ) -> std::collections::HashMap<(i64, i64), String> {
     let mut out = std::collections::HashMap::new();
-    for &(listing_id, image_id) in keys {
+    if keys.len() > MAX_IMAGE_LOOKUPS {
+        log::app_log(
+            "ERROR",
+            format!(
+                "Etsy: {} image keys over the {} cap, {} skipped and shown without a thumbnail",
+                keys.len(),
+                MAX_IMAGE_LOOKUPS,
+                keys.len() - MAX_IMAGE_LOOKUPS
+            ),
+        );
+    }
+    let mut failed = 0usize;
+    for &(listing_id, image_id) in keys.iter().take(MAX_IMAGE_LOOKUPS) {
         let url = format!(
             "https://api.etsy.com/v3/application/listings/{}/images/{}",
             listing_id, image_id
         );
-        let resp = client
-            .get(&url)
-            .header("x-api-key", x_api_key)
-            .header("Authorization", format!("Bearer {}", access_token))
-            .send()
-            .await;
-        if let Ok(r) = resp {
-            if r.status().is_success() {
-                if let Ok(img) = r.json::<EtsyListingImage>().await {
-                    let u = img
-                        .url_170x135
-                        .or(img.url_75x75)
-                        .filter(|s| !s.is_empty());
-                    if let Some(u) = u {
-                        out.insert((listing_id, image_id), u);
+        match etsy_get(client, &url, access_token, x_api_key).await {
+            Ok(r) => {
+                if r.status().is_success() {
+                    if let Ok(img) = r.json::<EtsyListingImage>().await {
+                        let u = img
+                            .url_170x135
+                            .or(img.url_75x75)
+                            .filter(|s| !s.is_empty());
+                        if let Some(u) = u {
+                            out.insert((listing_id, image_id), u);
+                        }
                     }
                 }
             }
+            Err(e) => {
+                failed += 1;
+                if failed == 1 {
+                    log::app_log("ERROR", format!("Etsy: image lookup failed: {}", e));
+                }
+            }
         }
+    }
+    if failed > 1 {
+        log::app_log("ERROR", format!("Etsy: {} image lookups failed in total", failed));
     }
     out
 }
@@ -223,40 +282,42 @@ async fn fetch_listing_image_urls(
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Fetch shop receipts (orders) from Etsy API v3 (last 60 days). Only paid, not-yet-shipped.
-pub async fn fetch_etsy_orders() -> Result<Vec<Order>, String> {
-    log::app_log("INFO", "Etsy: getting access token...");
-    let access_token = get_etsy_access_token().await?;
-    log::app_log("INFO", "Etsy: token OK, requesting receipts...");
-    let client = reqwest::Client::new();
-    const LIMIT: i32 = 100;
-    let base_url = format!(
-        "https://api.etsy.com/v3/application/shops/{}/receipts",
-        etsy_shop_id()
-    );
-    // Etsy (since 2026-02-09) requires keystring:shared_secret in x-api-key.
-    let x_api_key = format!("{}:{}", etsy_keystring(), etsy_secret());
+/// Fetch shop receipts (orders) from Etsy API v3.
+///
+/// `min_created` bounds the search by receipt creation time; None = full history.
+/// Paginate receipts for one filter combination. `include_shipped` false adds
+/// `was_shipped=false`; true omits it, returning shipped and unshipped alike.
+async fn sweep_receipts(
+    client: &reqwest::Client,
+    base_url: &str,
+    access_token: &str,
+    x_api_key: &str,
+    include_shipped: bool,
+    min_created: Option<DateTime<Utc>>,
+) -> Result<Vec<EtsyReceipt>, String> {
+    let shipped_param = if include_shipped { "" } else { "&was_shipped=false" };
+    // min_created is unix seconds, floored at 2000-01-01.
+    let created_param = match min_created {
+        Some(t) => format!("&min_created={}", t.timestamp().max(ETSY_MIN_TIMESTAMP)),
+        None => String::new(),
+    };
+    log::app_log("INFO", format!(
+        "Etsy: sweep (was_paid=true, include_shipped={}, min_created={})",
+        include_shipped,
+        min_created.map(|t| t.to_rfc3339()).unwrap_or_else(|| "none".to_string())
+    ));
 
-    let mut all_receipts = Vec::new();
+    let mut out: Vec<EtsyReceipt> = Vec::new();
     let mut offset = 0i32;
-
-    let was_paid = true;
-    let was_shipped = false;
-    log::app_log("INFO", format!("Etsy: fetching receipts (was_paid={}, was_shipped={})", was_paid, was_shipped));
-
+    let mut pages = 0u32;
     loop {
+        // Sorted desc so hitting MAX_RECEIPT_PAGES drops the oldest receipts, not the newest.
         let url = format!(
-            "{}?limit={}&offset={}&was_paid={}&was_shipped={}",
-            base_url, LIMIT, offset, was_paid, was_shipped
+            "{}?limit={}&offset={}&was_paid=true&sort_on=created&sort_order=desc{}{}",
+            base_url, RECEIPTS_LIMIT, offset, shipped_param, created_param
         );
         log::app_log("INFO", format!("Etsy: GET receipts offset={}", offset));
-        let response = client
-            .get(&url)
-            .header("x-api-key", &x_api_key)
-            .header("Authorization", format!("Bearer {}", access_token))
-            .send()
-            .await
-            .map_err(|e| format!("Etsy request failed: {}", e))?;
+        let response = etsy_get(client, &url, access_token, x_api_key).await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -287,17 +348,75 @@ pub async fn fetch_etsy_orders() -> Result<Vec<Order>, String> {
             }
         };
 
-        let results = page.results;
-        let n = results.len() as i32;
-        all_receipts.extend(results);
-        log::app_log("INFO", format!("Etsy: page offset={} got {} receipts (total so far: {})", offset, n, all_receipts.len()));
+        let reported_total = page.count;
+        let n = page.results.len() as i32;
+        out.extend(page.results);
+        pages += 1;
+        log::app_log("INFO", format!("Etsy: page offset={} got {} receipts (total so far: {})", offset, n, out.len()));
 
-        if n < LIMIT {
+        if n < RECEIPTS_LIMIT {
             break;
         }
-        offset += LIMIT;
+        if pages >= MAX_RECEIPT_PAGES {
+            log::app_log("ERROR", format!(
+                "Etsy: stopped at {} pages, {} of {} receipts fetched; older receipts skipped",
+                pages,
+                out.len(),
+                reported_total.map(|c| c.to_string()).unwrap_or_else(|| "?".to_string())
+            ));
+            break;
+        }
+        offset += RECEIPTS_LIMIT;
     }
+    Ok(out)
+}
 
+/// `include_shipped` false runs the routine two-sweep pull (all open work, any
+/// age, plus a windowed pass that also sees shipped receipts); true is the
+/// all-time backfill.
+pub async fn fetch_etsy_orders(
+    min_created: Option<DateTime<Utc>>,
+    include_shipped: bool,
+) -> Result<Vec<Order>, String> {
+    log::app_log("INFO", "Etsy: getting access token...");
+    let access_token = get_etsy_access_token().await?;
+    log::app_log("INFO", "Etsy: token OK, requesting receipts...");
+    let client = reqwest::Client::new();
+    let base_url = format!(
+        "https://api.etsy.com/v3/application/shops/{}/receipts",
+        etsy_shop_id()
+    );
+    // Etsy (since 2026-02-09) requires keystring:shared_secret in x-api-key.
+    let x_api_key = format!("{}:{}", etsy_keystring(), etsy_secret());
+
+    let mut all_receipts: Vec<EtsyReceipt> = Vec::new();
+    let mut seen_receipts: std::collections::HashSet<i64> = std::collections::HashSet::new();
+
+    // Unshipped receipts are swept with NO date bound, so an old open commission
+    // is never missed; the windowed sweep then also returns shipped receipts so a
+    // ship transition is observed and the order leaves the board.
+    let sweeps: Vec<(bool, Option<DateTime<Utc>>)> = if include_shipped {
+        vec![(true, min_created)]
+    } else {
+        vec![(false, None), (true, min_created)]
+    };
+
+    for (sweep_shipped, sweep_since) in sweeps {
+        let receipts = sweep_receipts(
+            &client,
+            &base_url,
+            &access_token,
+            &x_api_key,
+            sweep_shipped,
+            sweep_since,
+        )
+        .await?;
+        for r in receipts {
+            if seen_receipts.insert(r.receipt_id) {
+                all_receipts.push(r);
+            }
+        }
+    }
     log::app_log("INFO", format!("Etsy: {} receipts total, fetching listing images...", all_receipts.len()));
 
     let mut image_keys: Vec<(i64, i64)> = Vec::new();
@@ -320,7 +439,6 @@ pub async fn fetch_etsy_orders() -> Result<Vec<Order>, String> {
 
     log::app_log("INFO", format!("Etsy: got {} image URLs, mapping to orders...", image_urls.len()));
 
-    let two_months_ago = Utc::now() - Duration::days(60);
     let orders: Vec<Order> = all_receipts
         .into_iter()
         .filter_map(|r| {
@@ -330,9 +448,6 @@ pub async fn fetch_etsy_orders() -> Result<Vec<Order>, String> {
             } else {
                 Utc.timestamp_opt(order_ts, 0).single().unwrap_or(Utc::now())
             };
-            if order_date < two_months_ago {
-                return None;
-            }
             let due_date = r
                 .transactions
                 .as_deref()
@@ -455,6 +570,13 @@ pub async fn fetch_etsy_orders() -> Result<Vec<Order>, String> {
 
             let shipping_address = r.first_line.clone().or(r.formatted_address.clone());
 
+            let status = match (r.status.clone(), r.is_shipped) {
+                (Some(s), Some(true)) if s == "paid" => "shipped".to_string(),
+                (Some(s), _) => s,
+                (None, Some(true)) => "shipped".to_string(),
+                (None, _) => "open".to_string(),
+            };
+
             Some(Order {
                 id: r.receipt_id.to_string(),
                 source: OrderSource::Etsy,
@@ -472,10 +594,10 @@ pub async fn fetch_etsy_orders() -> Result<Vec<Order>, String> {
                 due_date,
                 total_price,
                 currency,
-                status: r.status.unwrap_or_else(|| "open".to_string()),
+                status,
                 shipping_address,
                 archived: false,
-                completed: false,
+                completed: r.is_shipped.unwrap_or(false),
                 notes: None,
                 stage: None,
             })
@@ -563,6 +685,7 @@ pub async fn fetch_etsy_listings() -> Result<Vec<crate::model::Listing>, String>
                     img.url_570xn
                         .clone()
                         .or_else(|| img.url_640x640.clone())
+                        .or_else(|| img.url_fullxfull.clone())
                         .or_else(|| img.url_170x135.clone())
                         .or_else(|| img.url_75x75.clone())
                 });
