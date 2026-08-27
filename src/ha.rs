@@ -2,7 +2,7 @@
 //! (`http://supervisor/core/api`, authed with SUPERVISOR_TOKEN — granted by
 //! `homeassistant_api: true` in the add-on config). Server-only.
 
-use crate::model::{MetalType, Order, OrderSource};
+use crate::model::{MetalType, Order, OrderItem, OrderSource};
 
 fn supervisor() -> Option<(String, reqwest::Client)> {
     let token = std::env::var("SUPERVISOR_TOKEN").ok().filter(|t| !t.is_empty())?;
@@ -15,6 +15,37 @@ fn src_str(s: &OrderSource) -> &'static str {
         OrderSource::Etsy => "etsy",
         OrderSource::Custom => "custom",
     }
+}
+
+/// One order item as structured JSON: what to make, in which size and metal.
+fn item_json(i: &OrderItem) -> serde_json::Value {
+    serde_json::json!({
+        "name": i.name,
+        "quantity": i.quantity,
+        "ring_size": i.ring_size.clone().unwrap_or_default(),
+        "metal": i.metal_type.display_name(),
+        "variant": i.variant_info.clone().unwrap_or_default(),
+        "price": i.price,
+    })
+}
+
+/// One item rendered for templates, e.g. "Hades Ring (US 11.5, Silver) x2".
+fn item_text(i: &OrderItem) -> String {
+    let mut spec = Vec::new();
+    if let Some(s) = i.ring_size.as_ref().filter(|s| !s.trim().is_empty()) {
+        spec.push(s.trim().to_string());
+    }
+    if !matches!(i.metal_type, MetalType::Unknown) {
+        spec.push(i.metal_type.display_name().to_string());
+    }
+    let spec = if spec.is_empty() { String::new() } else { format!(" ({})", spec.join(", ")) };
+    let qty = if i.quantity > 1 { format!(" x{}", i.quantity) } else { String::new() };
+    format!("{}{}{}", i.name, spec, qty)
+}
+
+/// Every item on an order joined into one line.
+fn items_text(o: &Order) -> String {
+    o.items.iter().map(item_text).collect::<Vec<_>>().join("; ")
 }
 
 async fn push_state(
@@ -130,7 +161,8 @@ pub async fn push_orders(orders: &[Order]) {
                 "total": o.total_price,
                 "stage": o.stage.clone().unwrap_or_default(),
                 "notes": o.notes.clone().unwrap_or_default(),
-                "items": o.items.iter().map(|i| i.name.clone()).collect::<Vec<_>>(),
+                "items": o.items.iter().map(item_json).collect::<Vec<_>>(),
+                "items_text": items_text(o),
             })
         })
         .collect();
@@ -163,7 +195,8 @@ pub async fn push_orders(orders: &[Order]) {
                     "source": src_str(&o.source),
                     "due": o.due_date.format("%Y-%m-%d").to_string(),
                     "total": o.total_price,
-                    "items": o.items.iter().map(|i| i.name.clone()).collect::<Vec<_>>(),
+                    "items": o.items.iter().map(item_json).collect::<Vec<_>>(),
+                    "items_text": items_text(o),
                 })).await;
             }
             newly.push(key);
@@ -175,4 +208,17 @@ pub async fn push_orders(orders: &[Order]) {
             let _ = crate::db::mark_seen(&newly).await;
         }
     }
+}
+
+/// Re-push the order sensors from the cached archive, without calling Shopify or Etsy.
+pub async fn push_cached() {
+    if supervisor().is_none() {
+        return;
+    }
+    let Ok(base) = crate::db::load_open_orders().await else {
+        return;
+    };
+    let mut orders = crate::db::merge_orders(base).await;
+    orders.sort_by(|a, b| a.due_date.cmp(&b.due_date));
+    push_orders(&orders).await;
 }

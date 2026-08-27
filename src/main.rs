@@ -263,6 +263,17 @@ fn server_main() {
                 }
             });
 
+            // Re-push the order sensors from cache every 5 minutes.
+            tokio::spawn(async {
+                tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+                loop {
+                    if crate::db::ensure_db_init().await.is_ok() {
+                        crate::ha::push_cached().await;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                }
+            });
+
             // Watch the kiln and auto-advance burnout stages on firing transitions.
             tokio::spawn(async {
                 let mut prev_firing: Option<bool> = None;
